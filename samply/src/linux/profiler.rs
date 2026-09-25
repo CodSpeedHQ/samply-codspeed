@@ -39,7 +39,7 @@ pub fn run(
     recording_mode: RecordingMode,
     recording_props: RecordingProps,
     profile_creation_props: ProfileCreationProps,
-) -> Result<(Profile, ExitStatus), ()> {
+) -> Result<(Profile, ExitStatus), std::convert::Infallible> {
     let process_launch_props = match recording_mode {
         RecordingMode::All => {
             // TODO: Implement, by sudo launching a helper process which opens cpu-wide perf events

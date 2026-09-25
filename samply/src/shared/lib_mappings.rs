@@ -87,7 +87,10 @@ pub struct LibMappingsHierarchy {
 impl LibMappingsHierarchy {
     pub fn new(regular_lib_mappings_ops: LibMappingOpQueue) -> Self {
         Self {
-            regular_libs: (LibMappings::default(), regular_lib_mappings_ops.into_iter()),
+            regular_libs: (
+                LibMappings::default(),
+                regular_lib_mappings_ops.into_queue_iter(),
+            ),
             jitdumps: Vec::new(),
             perf_map: None,
         }
@@ -95,7 +98,7 @@ impl LibMappingsHierarchy {
 
     pub fn add_jitdump_lib_mappings_ops(&mut self, lib_mappings_ops: LibMappingOpQueue) {
         self.jitdumps
-            .push((LibMappings::default(), lib_mappings_ops.into_iter()));
+            .push((LibMappings::default(), lib_mappings_ops.into_queue_iter()));
     }
 
     pub fn add_perf_map_mappings(&mut self, mappings: LibMappings<LibMappingInfo>) {
@@ -143,7 +146,7 @@ impl LibMappingOpQueue {
         self.0.is_empty()
     }
 
-    pub fn into_iter(self) -> LibMappingOpQueueIter {
+    pub fn into_queue_iter(self) -> LibMappingOpQueueIter {
         LibMappingOpQueueIter(self.0.into_iter().peekable())
     }
 }
