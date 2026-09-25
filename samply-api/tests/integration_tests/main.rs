@@ -116,13 +116,13 @@ impl FileAndPathHelper for Helper {
                     let redirected_path = self.symbol_directory.join(filename);
                     if std::fs::metadata(&redirected_path).is_ok() {
                         // redirected_path exists!
-                        eprintln!("Redirecting {:?} to {:?}", &path, &redirected_path);
+                        eprintln!("Redirecting {:?} to {:?}", path, redirected_path);
                         path = redirected_path;
                     }
                 }
             }
 
-            eprintln!("Reading file {:?}", &path);
+            eprintln!("Reading file {:?}", path);
             let file = File::open(&path)?;
             Ok(unsafe { memmap2::MmapOptions::new().map(&file)? })
         })

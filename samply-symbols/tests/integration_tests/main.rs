@@ -185,7 +185,7 @@ impl FileAndPathHelper for Helper {
     {
         Box::pin(async {
             let path = location.0;
-            eprintln!("Opening file {:?}", &path);
+            eprintln!("Opening file {:?}", path);
             let file = File::open(&path)?;
             let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
             Ok(mmap_to_file_contents(mmap))
