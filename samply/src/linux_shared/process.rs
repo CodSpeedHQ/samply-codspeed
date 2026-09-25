@@ -60,12 +60,6 @@ pub struct ExtraEventInstance {
     pub prev_value: u64,
 }
 
-/// The most recent stack windows kept per thread.
-const MAX_STACK_SNAPSHOTS: usize = 64;
-
-/// Minimum word-for-word overlap required to continue through an old snapshot.
-const MIN_SNAPSHOT_OVERLAP_WORDS: usize = 512;
-
 /// The user stack words `[sp, end())` captured with one sample.
 pub struct StackSnapshot {
     pub sp: u64,
@@ -103,9 +97,6 @@ impl StackSnapshot {
             return false;
         }
         let overlap_words = ((window.end() - self.stable_start) / 8) as usize;
-        if overlap_words < MIN_SNAPSHOT_OVERLAP_WORDS {
-            return false;
-        }
         let self_start = (stable_offset / 8) as usize;
         let window_start = (window_offset / 8) as usize;
         self.words
@@ -115,18 +106,29 @@ impl StackSnapshot {
     }
 }
 
-/// The recent stack windows of one thread, newest first.
+/// The stack windows of one thread that may still be current, newest first.
+/// Retirement and covering keep only snapshots that extend further up the
+/// stack than every newer one, so the count stays bounded by the stack depth.
 #[derive(Default)]
 pub struct ThreadStackSnapshots {
     ring: VecDeque<StackSnapshot>,
 }
 
 impl ThreadStackSnapshots {
+    /// Adds the newest snapshot. Older snapshots whose stable part it fully
+    /// covers are dropped: it holds fresher words for all of their addresses.
     pub fn push(&mut self, snapshot: StackSnapshot) {
-        if self.ring.len() >= MAX_STACK_SNAPSHOTS {
-            self.ring.pop_back();
-        }
+        self.ring.retain(|older| {
+            older.stable_start < snapshot.stable_start || older.end() > snapshot.end()
+        });
         self.ring.push_front(snapshot);
+    }
+
+    /// Drops the snapshots whose stable frames have returned by the time of a
+    /// sample at `sp`: the thread's stack pointer is now above their lowest
+    /// trusted slot, so the words there have been overwritten or will be.
+    pub fn retire_returned(&mut self, sp: u64) {
+        self.ring.retain(|snapshot| snapshot.stable_start >= sp);
     }
 
     /// The word at `addr` past the end of `window`, read from the snapshots
@@ -487,7 +489,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{StackSnapshot, MIN_SNAPSHOT_OVERLAP_WORDS};
+    use super::{StackSnapshot, ThreadStackSnapshots};
 
     const WINDOW_SP: u64 = 0x7fff_0000_0000;
     const WINDOW_WORDS: usize = 4096;
@@ -513,22 +515,40 @@ mod tests {
     }
 
     #[test]
-    fn continuation_requires_minimum_overlap() {
-        let window = window();
-        assert!(!earlier(MIN_SNAPSHOT_OVERLAP_WORDS - 1).continues(&window));
-        assert!(earlier(MIN_SNAPSHOT_OVERLAP_WORDS).continues(&window));
-    }
-
-    #[test]
     fn only_words_from_stable_start_must_match() {
         let window = window();
 
-        let mut leaf_differs = earlier(MIN_SNAPSHOT_OVERLAP_WORDS);
+        let mut leaf_differs = earlier(1);
         leaf_differs.words[0] = 0xdead;
         assert!(leaf_differs.continues(&window));
 
-        let mut overlap_differs = earlier(MIN_SNAPSHOT_OVERLAP_WORDS);
+        let mut overlap_differs = earlier(1);
         overlap_differs.words[1] = 0xdead;
         assert!(!overlap_differs.continues(&window));
+    }
+
+    #[test]
+    fn snapshots_are_retired_once_their_stable_frames_returned() {
+        let mut snapshots = ThreadStackSnapshots::default();
+        snapshots.push(earlier(16));
+        let stable_start = snapshots.ring[0].stable_start;
+
+        snapshots.retire_returned(stable_start);
+        assert_eq!(snapshots.ring.len(), 1);
+
+        snapshots.retire_returned(stable_start + 8);
+        assert!(snapshots.ring.is_empty());
+    }
+
+    #[test]
+    fn covered_snapshots_are_dropped() {
+        let mut snapshots = ThreadStackSnapshots::default();
+        snapshots.push(earlier(16));
+        // Same range, captured later: the older copy is redundant.
+        snapshots.push(earlier(16));
+        assert_eq!(snapshots.ring.len(), 1);
+        // Reaches less far up the stack: both are kept.
+        snapshots.push(earlier(8));
+        assert_eq!(snapshots.ring.len(), 2);
     }
 }

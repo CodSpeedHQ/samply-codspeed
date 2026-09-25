@@ -751,6 +751,9 @@ where
             };
             let mut stable_start = None;
             // Without a tid we can't tell whose stack earlier words came from.
+            if let Some(cache) = e.tid.and_then(|tid| stack_read_cache.get_mut(&tid)) {
+                cache.retire_returned(sp);
+            }
             let thread_cache = e.tid.and_then(|tid| stack_read_cache.get(&tid));
             // The snapshots followed past the window, extended lazily by reads.
             let mut chain = Vec::new();
