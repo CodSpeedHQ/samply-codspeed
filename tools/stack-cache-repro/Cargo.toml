@@ -1,0 +1,11 @@
+[package]
+name = "stack-cache-repro"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone: profiled by the replay script, not part of the samply workspace.
+[workspace]
+
+[profile.release]
+debug = 1
