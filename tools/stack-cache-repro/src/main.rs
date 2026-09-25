@@ -23,8 +23,12 @@ fn monotonic_ns() -> u64 {
 
 const FRAME_SIZE: usize = 2048;
 const MAX_DEPTH: usize = 35; // 35 * 2048 = 71680 bytes (> 32000 bytes)
-const WORK_PER_LEVEL_A: u64 = 40_000;
-const WORK_IN_LEAF_A: u64 = 1_000_000;
+// Phase A works long enough at every depth that one descent is sampled
+// several times on the way down: its snapshots then chain from the leaf up to
+// `main` without the thread returning in between, so the stack read cache can
+// complete deep phase A stacks even though it retires returned snapshots.
+const WORK_PER_LEVEL_A: u64 = 2_000_000;
+const WORK_IN_LEAF_A: u64 = 20_000_000;
 const WORK_IN_LEAF_B: u64 = 1_000_000;
 
 #[inline(never)]
