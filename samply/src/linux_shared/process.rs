@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use framehop::Unwinder;
@@ -34,12 +34,13 @@ pub struct Process<U> {
     pub jit_app_cache_mapping_ops: LibMappingOpQueue,
     pub jit_function_recycler: Option<JitFunctionRecycler>,
     marker_file_paths: Vec<(ThreadHandle, PathBuf, Vec<PathBuf>)>,
-    /// Per-process cache of stack memory previously read during unwinding,
-    /// keyed by absolute stack address. The upper part of the stack (the frames
-    /// above the churning leaf) is stable across samples, so when an unwind
-    /// walks past the current sample's captured stack window we can satisfy the
-    /// read from a value seen in an earlier sample instead of truncating.
-    pub stack_read_cache: HashMap<u64, u64>,
+    /// Per-thread rings of recent stack windows captured with samples, keyed
+    /// by tid. When an unwind walks past the current sample's captured stack
+    /// window, it continues through an earlier window of the same thread
+    /// whose overlap with the current one is word-for-word identical (see
+    /// [`StackSnapshot::continues`]). Other threads' stacks are unrelated, so
+    /// their windows must never be used.
+    pub stack_read_cache: HashMap<i32, ThreadStackSnapshots>,
     pub prev_mm_filepages_size: i64,
     pub prev_mm_anonpages_size: i64,
     pub prev_mm_swapents_size: i64,
@@ -57,6 +58,108 @@ pub struct ExtraEventInstance {
     /// The last raw value seen, used to turn the cumulative values carried by
     /// samples into per-sample deltas.
     pub prev_value: u64,
+}
+
+/// The most recent stack windows kept per thread.
+const MAX_STACK_SNAPSHOTS: usize = 64;
+
+/// Minimum word-for-word overlap required to continue through an old snapshot.
+const MIN_SNAPSHOT_OVERLAP_WORDS: usize = 512;
+
+/// The user stack words `[sp, end())` captured with one sample.
+pub struct StackSnapshot {
+    pub sp: u64,
+    pub stable_start: u64,
+    pub words: Vec<u64>,
+}
+
+impl StackSnapshot {
+    pub fn end(&self) -> u64 {
+        self.sp + self.words.len() as u64 * 8
+    }
+
+    /// The word at `addr`, if it lies inside this snapshot.
+    pub fn get(&self, addr: u64) -> Option<u64> {
+        let index = usize::try_from(addr.checked_sub(self.sp)? / 8).ok()?;
+        self.words.get(index).copied()
+    }
+
+    /// Whether `self`, captured by an earlier sample, continues `window` past
+    /// its end. Only words at or above this snapshot's stable start are
+    /// compared: words below it belong to the leaf frame and can change
+    /// between samples.
+    pub fn continues(&self, window: &StackSnapshot) -> bool {
+        if self.sp <= window.sp
+            || self.sp >= window.end()
+            || self.end() <= window.end()
+            || self.stable_start <= self.sp
+            || self.stable_start >= window.end()
+        {
+            return false;
+        }
+        let stable_offset = self.stable_start - self.sp;
+        let window_offset = self.stable_start - window.sp;
+        if stable_offset % 8 != 0 || window_offset % 8 != 0 {
+            return false;
+        }
+        let overlap_words = ((window.end() - self.stable_start) / 8) as usize;
+        if overlap_words < MIN_SNAPSHOT_OVERLAP_WORDS {
+            return false;
+        }
+        let self_start = (stable_offset / 8) as usize;
+        let window_start = (window_offset / 8) as usize;
+        self.words
+            .get(self_start..self_start + overlap_words)
+            .zip(window.words.get(window_start..window_start + overlap_words))
+            .is_some_and(|(self_words, window_words)| self_words == window_words)
+    }
+}
+
+/// The recent stack windows of one thread, newest first.
+#[derive(Default)]
+pub struct ThreadStackSnapshots {
+    ring: VecDeque<StackSnapshot>,
+}
+
+impl ThreadStackSnapshots {
+    pub fn push(&mut self, snapshot: StackSnapshot) {
+        if self.ring.len() >= MAX_STACK_SNAPSHOTS {
+            self.ring.pop_back();
+        }
+        self.ring.push_front(snapshot);
+    }
+
+    /// The word at `addr` past the end of `window`, read from the snapshots
+    /// that continue it. `chain` holds the indices of the snapshots followed
+    /// so far and is extended only when a read needs another hop.
+    pub fn read_past(
+        &self,
+        window: &StackSnapshot,
+        chain: &mut Vec<usize>,
+        addr: u64,
+    ) -> Option<u64> {
+        loop {
+            let tip = chain.last().map_or(window, |&index| &self.ring[index]);
+            if let Some(value) = tip.get(addr) {
+                return Some(value);
+            }
+            // Continuations only start above the tip's sp.
+            if addr < tip.sp {
+                return None;
+            }
+            let next = self.find_continuation(tip, chain)?;
+            chain.push(next);
+        }
+    }
+
+    /// The index of the newest snapshot that continues `window` (see
+    /// [`StackSnapshot::continues`]), skipping the indices in `used`.
+    fn find_continuation(&self, window: &StackSnapshot, used: &[usize]) -> Option<usize> {
+        self.ring
+            .iter()
+            .enumerate()
+            .position(|(index, snapshot)| !used.contains(&index) && snapshot.continues(window))
+    }
 }
 
 pub struct ProcessForkData<U> {
@@ -379,5 +482,53 @@ where
                 "Amount of allocated memory",
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StackSnapshot, MIN_SNAPSHOT_OVERLAP_WORDS};
+
+    const WINDOW_SP: u64 = 0x7fff_0000_0000;
+    const WINDOW_WORDS: usize = 4096;
+
+    fn window() -> StackSnapshot {
+        StackSnapshot {
+            sp: WINDOW_SP,
+            stable_start: WINDOW_SP,
+            words: vec![0; WINDOW_WORDS],
+        }
+    }
+
+    /// An earlier snapshot that matches `window()` on its last
+    /// `overlap_words` words and extends one word past it.
+    fn earlier(overlap_words: usize) -> StackSnapshot {
+        let stable_start = window().end() - overlap_words as u64 * 8;
+        let sp = stable_start - 8;
+        StackSnapshot {
+            sp,
+            stable_start,
+            words: vec![0; overlap_words + 2],
+        }
+    }
+
+    #[test]
+    fn continuation_requires_minimum_overlap() {
+        let window = window();
+        assert!(!earlier(MIN_SNAPSHOT_OVERLAP_WORDS - 1).continues(&window));
+        assert!(earlier(MIN_SNAPSHOT_OVERLAP_WORDS).continues(&window));
+    }
+
+    #[test]
+    fn only_words_from_stable_start_must_match() {
+        let window = window();
+
+        let mut leaf_differs = earlier(MIN_SNAPSHOT_OVERLAP_WORDS);
+        leaf_differs.words[0] = 0xdead;
+        assert!(leaf_differs.continues(&window));
+
+        let mut overlap_differs = earlier(MIN_SNAPSHOT_OVERLAP_WORDS);
+        overlap_differs.words[1] = 0xdead;
+        assert!(!overlap_differs.continues(&window));
     }
 }
