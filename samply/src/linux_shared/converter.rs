@@ -1509,10 +1509,9 @@ where
             }
         }
 
-        let name = match path.rfind('/') {
-            Some(pos) => path[pos + 1..].to_owned(),
-            None => path.clone(),
-        };
+        let name = Path::new(&path)
+            .file_name()
+            .map_or_else(|| path.clone(), |name| name.to_string_lossy().into_owned());
 
         let process = self.processes.get_by_pid(process_pid, &mut self.profile);
 
