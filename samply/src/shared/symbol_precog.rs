@@ -237,7 +237,7 @@ impl PrecogSymbolInfo {
         serde_json::from_reader(reader).expect("failed to parse sidecar syms.json")
     }
 
-    pub fn into_iter(self) -> impl Iterator<Item = PrecogLibraySymbolMap> {
+    pub fn into_symbol_maps(self) -> impl Iterator<Item = PrecogLibraySymbolMap> {
         let Self { data, string_table } = self;
         let string_table = Arc::new(string_table);
         data.into_iter()

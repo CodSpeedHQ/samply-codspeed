@@ -159,17 +159,13 @@ pub fn do_record_action(record_args: cli::RecordArgs) {
 
     // A process killed by a signal has no exit code; report it as 128 + signal,
     // following the shell convention.
+    #[cfg(unix)]
     let exit_code = exit_status.code().unwrap_or_else(|| {
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            exit_status.signal().map_or(1, |signal| 128 + signal)
-        }
-        #[cfg(not(unix))]
-        {
-            1
-        }
+        use std::os::unix::process::ExitStatusExt;
+        exit_status.signal().map_or(1, |signal| 128 + signal)
     });
+    #[cfg(not(unix))]
+    let exit_code = exit_status.code().unwrap_or(1);
     std::process::exit(exit_code);
 }
 
@@ -256,7 +252,7 @@ pub fn run_server_serving_profile(
 
         let precog_path = profile_path.with_extension("syms.json");
         if let Some(precog_info) = shared::symbol_precog::PrecogSymbolInfo::try_load(&precog_path) {
-            for symbol_map in precog_info.into_iter() {
+            for symbol_map in precog_info.into_symbol_maps() {
                 let lib_info = symbol_map.library_info();
                 symbol_manager.add_known_library_symbols(lib_info, Arc::new(symbol_map));
             }
