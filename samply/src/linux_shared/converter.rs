@@ -1186,6 +1186,8 @@ where
             process
                 .threads
                 .remove_non_main_thread(e.tid, end_time, &mut self.profile);
+            // The tid may be reused by an unrelated thread.
+            process.stack_read_cache.remove(&e.tid);
         }
     }
 
@@ -1246,6 +1248,7 @@ where
             process
                 .threads
                 .remove_non_main_thread(e.tid, timestamp, &mut self.profile);
+            process.stack_read_cache.remove(&e.tid);
             process.recycle_or_get_new_thread(
                 e.tid,
                 Some(name.to_string()),
