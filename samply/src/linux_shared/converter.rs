@@ -38,7 +38,7 @@ use super::injected_jit_object::{correct_bad_perf_jit_so_file, jit_function_name
 use super::kernel_symbols::{kernel_module_build_id, KernelSymbols};
 use super::mmap_range_or_vec::MmapRangeOrVec;
 use super::pe_mappings::{PeMappings, SuspectedPeMapping};
-use super::process::ExtraEventInstance;
+use super::process::{ExtraEventInstance, StackSnapshot, ThreadStackSnapshots};
 use super::processes::Processes;
 use super::rss_stat::{RssStat, MM_ANONPAGES, MM_FILEPAGES, MM_SHMEMPAGES, MM_SWAPENTS};
 use super::svma_file_range::compute_vma_bias;
@@ -693,12 +693,12 @@ where
         e: &SampleRecord,
         unwinder: &U,
         cache: &mut U::Cache,
-        stack_read_cache: &mut std::collections::HashMap<u64, u64>,
+        stack_read_cache: &mut HashMap<i32, ThreadStackSnapshots>,
         stack: &mut Vec<StackFrame>,
         fold_recursive_prefix: bool,
         call_chain_return_addresses_are_preadjusted: bool,
     ) {
-        stack.truncate(0);
+        stack.clear();
 
         // Parse e.callchain into kernel frames and user FP frames.
         let mut callchain_buf = Vec::new();
@@ -738,23 +738,33 @@ where
         if let (Some(regs), Some((user_stack, _))) = (&e.user_regs, e.user_stack) {
             let ustack_bytes = RawDataU64::from_raw_data::<LittleEndian>(user_stack);
             let (pc, sp, regs) = C::convert_regs(regs);
+            let sample_window = StackSnapshot {
+                sp,
+                // The current window is only used as the base of a
+                // continuation check. Its stable start is learned while
+                // unwinding and is set on the snapshot stored afterward.
+                stable_start: sp,
+                // The whole captured window: perf bounds it (at most ~64 KiB).
+                words: (0..ustack_bytes.len())
+                    .filter_map(|index| ustack_bytes.get(index))
+                    .collect(),
+            };
+            let mut stable_start = None;
+            // Without a tid we can't tell whose stack earlier words came from.
+            if let Some(cache) = e.tid.and_then(|tid| stack_read_cache.get_mut(&tid)) {
+                cache.retire_returned(sp);
+            }
+            let thread_cache = e.tid.and_then(|tid| stack_read_cache.get(&tid));
+            // The snapshots followed past the window, extended lazily by reads.
+            let mut chain = Vec::new();
             let mut read_stack = |addr: u64| {
-                // Prefer this sample's freshly captured stack window. ustack_bytes
-                // has the stack bytes starting from the current stack pointer.
-                if let Some(value) = addr
-                    .checked_sub(sp)
-                    .and_then(|offset| usize::try_from(offset / 8).ok())
-                    .and_then(|index| ustack_bytes.get(index))
-                {
-                    // Remember it: the upper stack is stable across samples, so a
-                    // later sample whose window doesn't reach this far can still
-                    // satisfy the read.
-                    stack_read_cache.insert(addr, value);
+                if let Some(value) = sample_window.get(addr) {
+                    stable_start = Some(stable_start.map_or(addr, |start: u64| start.min(addr)));
                     return Ok(value);
                 }
-                // The read is below sp or past the captured window. Fall back to
-                // a value seen in an earlier sample, if any.
-                stack_read_cache.get(&addr).copied().ok_or(())
+                thread_cache
+                    .and_then(|cache| cache.read_past(&sample_window, &mut chain, addr))
+                    .ok_or(())
             };
 
             // Unwind.
@@ -777,6 +787,15 @@ where
                     }
                 };
                 stack.push(stack_frame);
+            }
+            if let (Some(tid), Some(stable_start)) = (e.tid, stable_start) {
+                stack_read_cache
+                    .entry(tid)
+                    .or_default()
+                    .push(StackSnapshot {
+                        stable_start,
+                        ..sample_window
+                    });
             }
         }
 
@@ -1170,6 +1189,8 @@ where
             process
                 .threads
                 .remove_non_main_thread(e.tid, end_time, &mut self.profile);
+            // The tid may be reused by an unrelated thread.
+            process.stack_read_cache.remove(&e.tid);
         }
     }
 
@@ -1230,6 +1251,7 @@ where
             process
                 .threads
                 .remove_non_main_thread(e.tid, timestamp, &mut self.profile);
+            process.stack_read_cache.remove(&e.tid);
             process.recycle_or_get_new_thread(
                 e.tid,
                 Some(name.to_string()),
@@ -1509,10 +1531,9 @@ where
             }
         }
 
-        let name = match path.rfind('/') {
-            Some(pos) => path[pos + 1..].to_owned(),
-            None => path.clone(),
-        };
+        let name = Path::new(&path)
+            .file_name()
+            .map_or_else(|| path.clone(), |name| name.to_string_lossy().into_owned());
 
         let process = self.processes.get_by_pid(process_pid, &mut self.profile);
 
