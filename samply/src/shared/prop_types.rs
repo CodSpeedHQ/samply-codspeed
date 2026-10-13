@@ -31,6 +31,9 @@ pub enum UnwindingMode {
     Fp,
 }
 
+/// Default bytes of user stack copied per sample for DWARF unwinding.
+pub const DEFAULT_UNWINDING_STACK_SIZE: u32 = 32_000;
+
 /// Properties which are meaningful both for recording a fresh process
 /// as well as for recording an existing process.
 #[derive(Debug, Clone)]
@@ -41,6 +44,9 @@ pub struct RecordingProps {
     pub interval: Duration,
     #[allow(dead_code)] // Only used on Linux and Android
     pub unwinding_mode: UnwindingMode,
+    /// Bytes of user stack copied per sample for DWARF unwinding.
+    #[allow(dead_code)] // Only used on Linux
+    pub unwinding_stack_size: u32,
     /// Names of extra perf events to record alongside the main sampling
     /// event. Only used on Linux.
     #[allow(dead_code)]
