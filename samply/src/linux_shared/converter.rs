@@ -2159,3 +2159,167 @@ impl Marker for MmapMarker {
         self.0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use framehop::x86_64::{CacheX86_64, UnwinderX86_64};
+    use framehop::{ExplicitModuleSectionInfo, Module, Unwinder};
+    use linux_perf_data::linux_perf_event_reader;
+    use linux_perf_event_reader::constants::{PERF_CONTEXT_KERNEL, PERF_CONTEXT_USER};
+    use linux_perf_event_reader::{CpuMode, RawData, RawDataU64, SampleRecord};
+
+    use super::{Converter, MmapRangeOrVec};
+    use crate::linux_shared::convert_regs::ConvertRegsX86_64;
+    use crate::shared::types::{StackFrame, StackMode};
+
+    fn callchain_only_stack(
+        ip: u64,
+        cpu_mode: CpuMode,
+        callchain: Option<&[u64]>,
+    ) -> Vec<StackFrame> {
+        let callchain_bytes = callchain.map(|addresses| {
+            addresses
+                .iter()
+                .flat_map(|address| address.to_le_bytes())
+                .collect::<Vec<_>>()
+        });
+        let sample = SampleRecord {
+            id: None,
+            addr: None,
+            stream_id: None,
+            raw: None,
+            ip: Some(ip),
+            timestamp: None,
+            pid: Some(1),
+            tid: Some(1),
+            cpu: None,
+            period: None,
+            read: None,
+            user_regs: None,
+            user_stack: None,
+            callchain: callchain_bytes.as_ref().map(|bytes| {
+                RawDataU64::from_raw_data::<byteorder::LittleEndian>(RawData::Single(bytes))
+            }),
+            phys_addr: None,
+            data_page_size: None,
+            code_page_size: None,
+            intr_regs: None,
+            cpu_mode,
+        };
+
+        let mut unwinder = UnwinderX86_64::<MmapRangeOrVec>::new();
+        // Known code addresses keep root trimming from discarding valid FP frames.
+        unwinder.add_module(Module::new(
+            "test-module".to_string(),
+            0x1000..0x2000,
+            0x1000,
+            ExplicitModuleSectionInfo {
+                base_svma: 0,
+                text_svma: None,
+                text: None,
+                stubs_svma: None,
+                stub_helper_svma: None,
+                got_svma: None,
+                unwind_info: None,
+                eh_frame_svma: None,
+                eh_frame: None,
+                eh_frame_hdr_svma: None,
+                eh_frame_hdr: None,
+                debug_frame: None,
+                text_segment_svma: None,
+                text_segment: None,
+            },
+        ));
+        let mut stack = Vec::new();
+        Converter::<UnwinderX86_64<MmapRangeOrVec>>::get_sample_stack::<ConvertRegsX86_64>(
+            &sample,
+            &unwinder,
+            &mut CacheX86_64::new(),
+            &mut std::collections::HashMap::new(),
+            &mut stack,
+            false,
+            false,
+        );
+        stack
+    }
+
+    #[test]
+    fn fp_only_callchain_preserves_user_frame_order_without_duplicating_sampled_ip() {
+        let stack = callchain_only_stack(
+            0x1010,
+            CpuMode::User,
+            Some(&[PERF_CONTEXT_USER, 0x1010, 0x1020, 0x1030]),
+        );
+
+        assert_eq!(
+            stack,
+            vec![
+                StackFrame::InstructionPointer(0x1010, StackMode::User),
+                StackFrame::ReturnAddress(0x1020, StackMode::User),
+                StackFrame::ReturnAddress(0x1030, StackMode::User),
+            ]
+        );
+    }
+
+    #[test]
+    fn fp_only_callchain_preserves_kernel_to_user_context_transition() {
+        let kernel_ip = 0xffff_8000_0000_0010;
+        let kernel_caller = 0xffff_8000_0000_0020;
+        let stack = callchain_only_stack(
+            kernel_ip,
+            CpuMode::Kernel,
+            Some(&[
+                PERF_CONTEXT_KERNEL,
+                kernel_ip,
+                kernel_caller,
+                PERF_CONTEXT_USER,
+                0x1010,
+                0x1020,
+            ]),
+        );
+
+        assert_eq!(
+            stack,
+            vec![
+                StackFrame::InstructionPointer(kernel_ip, StackMode::Kernel),
+                StackFrame::ReturnAddress(kernel_caller, StackMode::Kernel),
+                StackFrame::ReturnAddress(0x1010, StackMode::User),
+                StackFrame::ReturnAddress(0x1020, StackMode::User),
+            ]
+        );
+    }
+
+    #[test]
+    fn fp_only_leaf_callchain_keeps_one_sampled_ip() {
+        let stack = callchain_only_stack(0x1010, CpuMode::User, Some(&[PERF_CONTEXT_USER, 0x1010]));
+
+        assert_eq!(
+            stack,
+            vec![StackFrame::InstructionPointer(0x1010, StackMode::User)]
+        );
+    }
+
+    #[test]
+    fn fp_only_empty_callchains_fall_back_to_sampled_ip() {
+        let callchains: [Option<&[u64]>; 3] = [None, Some(&[]), Some(&[PERF_CONTEXT_USER])];
+        for callchain in callchains {
+            let stack = callchain_only_stack(0x1010, CpuMode::User, callchain);
+
+            assert_eq!(
+                stack,
+                vec![StackFrame::InstructionPointer(0x1010, StackMode::User)],
+                "callchain: {callchain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fp_only_unmapped_leaf_callchain_falls_back_to_sampled_ip() {
+        let stack = callchain_only_stack(0x9000, CpuMode::User, Some(&[PERF_CONTEXT_USER, 0x9000]));
+
+        assert_eq!(
+            stack,
+            vec![StackFrame::InstructionPointer(0x9000, StackMode::User)]
+        );
+    }
+}
