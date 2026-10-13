@@ -10,7 +10,7 @@ use super::server::{PortSelection, ServerProps};
 use super::shared::included_processes::IncludedProcesses;
 use super::shared::prop_types::{
     CoreClrProfileProps, ImportProps, ProcessLaunchProps, ProfileCreationProps, RecordingMode,
-    RecordingProps, SymbolProps,
+    RecordingProps, SymbolProps, UnwindingMode,
 };
 
 #[derive(Debug, Parser)]
@@ -132,6 +132,11 @@ pub struct RecordArgs {
     /// Sampling rate, in Hz
     #[arg(short, long, default_value = "1000")]
     pub rate: f64,
+
+    /// Stack unwinding method (Linux only).
+    #[cfg(target_os = "linux")]
+    #[arg(long, value_enum, default_value = "dwarf")]
+    pub unwinding_mode: UnwindingMode,
 
     /// Limit the recorded time to the specified number of seconds
     #[arg(short, long)]
@@ -456,6 +461,10 @@ impl RecordArgs {
             output_file: self.output.clone(),
             time_limit,
             interval,
+            #[cfg(target_os = "linux")]
+            unwinding_mode: self.unwinding_mode,
+            #[cfg(not(target_os = "linux"))]
+            unwinding_mode: UnwindingMode::Dwarf,
             perf_events,
             gfx: self.gfx,
             browsers: self.browsers,
@@ -647,5 +656,59 @@ mod test {
         // Make sure you can't pass both a pid and a command name at the same time.
         let opt_res = Opt::try_parse_from(["samply", "record", "-p", "1234", "rustup"]);
         assert!(opt_res.is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn record_fp_unwinding_with_launched_command() {
+        let opt = Opt::try_parse_from([
+            "samply",
+            "record",
+            "--unwinding-mode",
+            "fp",
+            "rustup",
+            "--version",
+        ])
+        .unwrap();
+        let Action::Record(args) = opt.action else {
+            panic!("expected record action");
+        };
+        assert_eq!(args.unwinding_mode, UnwindingMode::Fp);
+        assert_eq!(args.command, ["rustup", "--version"]);
+        assert!(matches!(args.recording_mode(), RecordingMode::Launch(_)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn record_fp_unwinding_with_pid_attach() {
+        let opt = Opt::try_parse_from([
+            "samply",
+            "record",
+            "--unwinding-mode",
+            "fp",
+            "--pid",
+            "1234",
+        ])
+        .unwrap();
+        let Action::Record(args) = opt.action else {
+            panic!("expected record action");
+        };
+        assert_eq!(args.unwinding_mode, UnwindingMode::Fp);
+        assert!(matches!(args.recording_mode(), RecordingMode::Pid(1234)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn record_rejects_unsupported_unwinding_mode() {
+        let error = Opt::try_parse_from([
+            "samply",
+            "record",
+            "--unwinding-mode",
+            "unsupported",
+            "--pid",
+            "1234",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
     }
 }

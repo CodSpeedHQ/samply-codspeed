@@ -25,6 +25,12 @@ impl CoreClrProfileProps {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum UnwindingMode {
+    Dwarf,
+    Fp,
+}
+
 /// Properties which are meaningful both for recording a fresh process
 /// as well as for recording an existing process.
 #[derive(Debug, Clone)]
@@ -33,6 +39,8 @@ pub struct RecordingProps {
     pub output_file: PathBuf,
     pub time_limit: Option<Duration>,
     pub interval: Duration,
+    #[allow(dead_code)] // Only used on Linux and Android
+    pub unwinding_mode: UnwindingMode,
     /// Names of extra perf events to record alongside the main sampling
     /// event. Only used on Linux.
     #[allow(dead_code)]

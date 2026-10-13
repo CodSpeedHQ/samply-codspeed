@@ -26,7 +26,7 @@ use crate::linux_shared::{
 };
 use crate::shared::ctrl_c::CtrlC;
 use crate::shared::prop_types::{
-    ProcessLaunchProps, ProfileCreationProps, RecordingMode, RecordingProps,
+    ProcessLaunchProps, ProfileCreationProps, RecordingMode, RecordingProps, UnwindingMode,
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -93,6 +93,7 @@ pub fn run(
 
     // Launch the observer thread. This thread will manage the perf events.
     let interval = recording_props.interval;
+    let unwinding_mode = recording_props.unwinding_mode;
     let time_limit = recording_props.time_limit;
     // Resolve the extra event names before launching anything, so that a
     // configuration error aborts immediately.
@@ -117,7 +118,14 @@ pub fn run(
         };
 
         // Create the perf events, setting ENABLE_ON_EXEC.
-        let perf_group = init_profiler(interval, pid, attach_mode, extra_events, &mut converter);
+        let perf_group = init_profiler(
+            interval,
+            unwinding_mode,
+            pid,
+            attach_mode,
+            extra_events,
+            &mut converter,
+        );
 
         // Tell the main thread to tell the child process to begin executing.
         profile_another_pid_reply_sender.send(true).unwrap();
@@ -281,8 +289,14 @@ fn start_profiling_pid(
             else {
                 panic!("The first message should be a StartProfilingAnotherProcess")
             };
-            let perf_group =
-                init_profiler(interval, pid, attach_mode, extra_events, &mut converter);
+            let perf_group = init_profiler(
+                interval,
+                recording_props.unwinding_mode,
+                pid,
+                attach_mode,
+                extra_events,
+                &mut converter,
+            );
 
             // Tell the main thread that we are now executing.
             profile_another_pid_reply_sender.send(true).unwrap();
@@ -403,6 +417,7 @@ fn resolve_extra_events(specs: &[String]) -> Vec<ExtraEvent> {
 
 fn init_profiler(
     interval: Duration,
+    unwinding_mode: UnwindingMode,
     pid: u32,
     attach_mode: AttachMode,
     extra_events: Vec<ExtraEvent>,
@@ -417,8 +432,11 @@ fn init_profiler(
     };
 
     let frequency = (1_000_000_000 / interval_nanos) as u32;
-    let stack_size = 32000;
-    let regs_mask = ConvertRegsNative::regs_mask();
+    const DWARF_STACK_SIZE: u32 = 32_000;
+    let (stack_size, regs_mask) = match unwinding_mode {
+        UnwindingMode::Dwarf => (DWARF_STACK_SIZE, ConvertRegsNative::regs_mask()),
+        UnwindingMode::Fp => (0, 0),
+    };
 
     let mut perf = PerfGroup::open(
         pid,
