@@ -121,6 +121,26 @@ fn sample_stacks(profile: &Value) -> Vec<Vec<u64>> {
     stacks
 }
 
+fn sample_root_names(profile: &Value) -> Vec<&str> {
+    let shared = &profile["shared"];
+    profile["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|thread| thread["samples"]["stack"].as_array().unwrap())
+        .map(|stack| {
+            let mut stack = stack.as_u64().unwrap() as usize;
+            while let Some(prefix) = shared["stackTable"]["prefix"][stack].as_u64() {
+                stack = prefix as usize;
+            }
+            let frame = shared["stackTable"]["frame"][stack].as_u64().unwrap() as usize;
+            let func = shared["frameTable"]["func"][frame].as_u64().unwrap() as usize;
+            let name = shared["funcTable"]["name"][func].as_u64().unwrap() as usize;
+            shared["stringArray"][name].as_str().unwrap()
+        })
+        .collect()
+}
+
 #[test]
 fn replayed_stacks_are_not_spliced_from_earlier_samples() {
     let dir = fixture_dir();
@@ -184,4 +204,15 @@ fn replayed_stacks_are_not_spliced_from_earlier_samples() {
         complete_a > 0,
         "no phase A stack was completed past the stack copy"
     );
+
+    // Phase B never visits shallower frames, so no matching snapshot can
+    // complete its deep stack. The exported root must expose that truncation.
+    for (stack, root_name) in stacks.iter().zip(sample_root_names(&profile)) {
+        if stack
+            .first()
+            .is_some_and(|addr| functions.b_leaf.contains(addr))
+        {
+            assert_eq!(root_name, "[truncated]");
+        }
+    }
 }
