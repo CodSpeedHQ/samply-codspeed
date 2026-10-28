@@ -386,7 +386,10 @@ impl PerfGroup {
                 self.members.remove(&fd);
             }
 
-            if !self.event_sorter.has_more() {
+            // System-wide per-CPU buffers keep receiving events from every
+            // process on the host (including this one), so a pass that reads
+            // nothing may never happen: stop after one pass instead.
+            if self.system_wide || !self.event_sorter.has_more() {
                 break;
             }
         }
