@@ -4,7 +4,9 @@ use std::sync::Arc;
 use fxprof_processed_profile::{
     LibraryHandle, MarkerTiming, Profile, Symbol, SymbolTable, ThreadHandle,
 };
-use linux_perf_data::jitdump::{JitDumpReader, JitDumpRecord, JitDumpRecordType};
+use linux_perf_data::jitdump::{
+    JitDumpReader, JitDumpRecord, JitDumpRecordHeader, JitDumpRecordType,
+};
 
 use super::jit_category_manager::JitCategoryManager;
 use super::jit_function_add_marker::JitFunctionAddMarker;
@@ -152,6 +154,11 @@ impl SingleJitDumpProcessor {
             return;
         };
         while let Ok(Some(next_record_header)) = reader.next_record_header() {
+            if (next_record_header.total_size as usize) < JitDumpRecordHeader::SIZE {
+                // Corrupted file. Skipping a record smaller than its own header seeks back
+                // onto that same header, so the reader would never make progress.
+                break;
+            }
             match next_record_header.record_type {
                 JitDumpRecordType::JIT_CODE_LOAD
                 | JitDumpRecordType::JIT_CODE_MOVE
@@ -265,5 +272,102 @@ impl SingleJitDumpProcessor {
     pub fn finish(mut self, profile: &mut Profile) -> LibMappingOpQueue {
         self.close_and_commit_symbol_table(profile);
         self.lib_mapping_ops
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use fxprof_processed_profile::{ReferenceTimestamp, SamplingInterval, Timestamp};
+
+    use super::*;
+
+    fn code_load_record(name: &str, code_addr: u64) -> Vec<u8> {
+        let code = [0u8; 20];
+        let total_size = 16 + 40 + name.len() + 1 + code.len();
+        let mut r = Vec::new();
+        r.extend_from_slice(&0u32.to_le_bytes()); // JIT_CODE_LOAD
+        r.extend_from_slice(&(total_size as u32).to_le_bytes());
+        r.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+        r.extend_from_slice(&1u32.to_le_bytes()); // pid
+        r.extend_from_slice(&1u32.to_le_bytes()); // tid
+        r.extend_from_slice(&code_addr.to_le_bytes()); // vma
+        r.extend_from_slice(&code_addr.to_le_bytes());
+        r.extend_from_slice(&(code.len() as u64).to_le_bytes());
+        r.extend_from_slice(&0u64.to_le_bytes()); // code_index
+        r.extend_from_slice(name.as_bytes());
+        r.push(0);
+        r.extend_from_slice(&code);
+        r
+    }
+
+    /// A valid record, then a header with an unknown type and `total_size == 0`, as seen
+    /// after CPython duplicated buffered jitdump bytes on fork, then another valid record.
+    fn jitdump_with_zero_sized_record() -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&0x4A695444u32.to_le_bytes()); // magic "JiTD"
+        d.extend_from_slice(&1u32.to_le_bytes()); // version
+        d.extend_from_slice(&40u32.to_le_bytes()); // header size
+        d.extend_from_slice(&183u32.to_le_bytes()); // EM_AARCH64
+        d.extend_from_slice(&0u32.to_le_bytes()); // pad
+        d.extend_from_slice(&1u32.to_le_bytes()); // pid
+        d.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+        d.extend_from_slice(&0u64.to_le_bytes()); // flags
+        d.extend(code_load_record("py::first", 0x1000));
+        d.extend_from_slice(&0x1400u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0u64.to_le_bytes());
+        d.extend(code_load_record("py::after_corruption", 0x2000));
+        d
+    }
+
+    #[test]
+    fn stops_at_record_smaller_than_its_header() {
+        let path =
+            std::env::temp_dir().join(format!("jit-zero-sized-record-{}.dump", std::process::id()));
+        std::fs::write(&path, jitdump_with_zero_sized_record()).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let thread_path = path.clone();
+        std::thread::spawn(move || {
+            let mut profile = Profile::new(
+                "",
+                ReferenceTimestamp::from_millis_since_unix_epoch(0.0),
+                SamplingInterval::from_millis(1),
+            );
+            let process = profile.add_process("p", 1, Timestamp::from_millis_since_reference(0.0));
+            let thread = profile.add_thread(
+                process,
+                1,
+                Timestamp::from_millis_since_reference(0.0),
+                true,
+            );
+            let mut manager = JitDumpManager::new(false, false);
+            manager.add_jitdump_path(thread, thread_path, vec![]);
+            let queues = manager.finish(
+                &mut JitCategoryManager::new(),
+                &mut profile,
+                None,
+                &TimestampConverter {
+                    reference_raw: 0,
+                    raw_to_ns_factor: 1,
+                },
+            );
+            let ops: Vec<usize> = queues
+                .into_iter()
+                .map(|queue| {
+                    let mut ops = queue.into_iter();
+                    std::iter::from_fn(|| ops.next_op_if_at_or_before(u64::MAX)).count()
+                })
+                .collect();
+            tx.send(ops).unwrap();
+        });
+        let ops = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("jitdump processing did not terminate");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(ops, vec![1]);
     }
 }

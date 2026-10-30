@@ -83,6 +83,11 @@ impl JitDumpIndex {
         let mut cumulative_address = 0;
         let mut offset_and_len_of_pending_debug_record = None;
         while let Some(record_header) = reader.next_record_header()? {
+            if (record_header.total_size as usize) < JitDumpRecordHeader::SIZE {
+                // Corrupted file. Skipping a record smaller than its own header seeks back
+                // onto that same header, so the reader would never make progress.
+                break;
+            }
             match record_header.record_type {
                 JitDumpRecordType::JIT_CODE_LOAD => {
                     // Read the full record.
@@ -444,5 +449,68 @@ impl<T: FileContents> SymbolMapTrait for JitDumpSymbolMapInner<'_, T> {
             .string_interner
             .resolve(handle.into());
         SourceFilePath::RawPath(s.expect("unknown handle?"))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::io::Cursor;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::*;
+
+    fn code_load_record(name: &str, code_addr: u64) -> Vec<u8> {
+        let code = [0u8; 20];
+        let total_size = 16 + 40 + name.len() + 1 + code.len();
+        let mut r = Vec::new();
+        r.extend_from_slice(&0u32.to_le_bytes()); // JIT_CODE_LOAD
+        r.extend_from_slice(&(total_size as u32).to_le_bytes());
+        r.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+        r.extend_from_slice(&1u32.to_le_bytes()); // pid
+        r.extend_from_slice(&1u32.to_le_bytes()); // tid
+        r.extend_from_slice(&code_addr.to_le_bytes()); // vma
+        r.extend_from_slice(&code_addr.to_le_bytes());
+        r.extend_from_slice(&(code.len() as u64).to_le_bytes());
+        r.extend_from_slice(&0u64.to_le_bytes()); // code_index
+        r.extend_from_slice(name.as_bytes());
+        r.push(0);
+        r.extend_from_slice(&code);
+        r
+    }
+
+    /// A valid record, then a header with an unknown type and `total_size == 0`, as seen
+    /// after CPython duplicated buffered jitdump bytes on fork, then another valid record.
+    fn jitdump_with_zero_sized_record() -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&0x4A695444u32.to_le_bytes()); // magic "JiTD"
+        d.extend_from_slice(&1u32.to_le_bytes()); // version
+        d.extend_from_slice(&40u32.to_le_bytes()); // header size
+        d.extend_from_slice(&183u32.to_le_bytes()); // EM_AARCH64
+        d.extend_from_slice(&0u32.to_le_bytes()); // pad
+        d.extend_from_slice(&1u32.to_le_bytes()); // pid
+        d.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+        d.extend_from_slice(&0u64.to_le_bytes()); // flags
+        d.extend(code_load_record("py::first", 0x1000));
+        d.extend_from_slice(&0x1400u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0u64.to_le_bytes());
+        d.extend(code_load_record("py::after_corruption", 0x2000));
+        d
+    }
+
+    #[test]
+    fn index_stops_at_record_smaller_than_its_header() {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let reader = JitDumpReader::new(Cursor::new(jitdump_with_zero_sized_record())).unwrap();
+            tx.send(JitDumpIndex::from_reader(reader).map(|index| index.entries.len()))
+                .unwrap();
+        });
+        let entries = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("JitDumpIndex::from_reader did not terminate")
+            .unwrap();
+        assert_eq!(entries, 1);
     }
 }
