@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use std::{mem, thread};
 
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, Sender};
 use fxprof_processed_profile::{
     Category, CategoryColor, PlatformSpecificReferenceTimestamp, Profile, ReferenceTimestamp,
     SubcategoryHandle,
@@ -41,6 +41,7 @@ pub struct TaskInit {
 
 pub struct Sampler {
     task_receiver: Receiver<TaskInitOrShutdown>,
+    task_initialized_sender: Sender<()>,
     recording_props: Arc<RecordingProps>,
     profile_creation_props: Arc<ProfileCreationProps>,
 }
@@ -48,11 +49,13 @@ pub struct Sampler {
 impl Sampler {
     pub fn new(
         task_receiver: Receiver<TaskInitOrShutdown>,
+        task_initialized_sender: Sender<()>,
         recording_props: RecordingProps,
         profile_creation_props: ProfileCreationProps,
     ) -> Self {
         Sampler {
             task_receiver,
+            task_initialized_sender,
             recording_props: Arc::new(recording_props),
             profile_creation_props: Arc::new(profile_creation_props),
         }
@@ -110,8 +113,9 @@ impl Sampler {
             &mut profile,
             process_recycler.as_mut(),
             self.profile_creation_props.clone(),
-        )
-        .expect("couldn't create root TaskProfiler");
+        );
+        self.task_initialized_sender.send(()).ok();
+        let root_task = root_task.expect("couldn't create root TaskProfiler");
 
         let mut process_sample_datas = Vec::new();
         let mut stack_scratch_buffer = Vec::new();
@@ -144,14 +148,16 @@ impl Sampler {
                         break;
                     }
                 };
-                if let Ok(new_task) = TaskProfiler::new(
+                let new_task = TaskProfiler::new(
                     task_init,
                     timestamp_converter,
                     &self.profile_creation_props.fallback_profile_name,
                     &mut profile,
                     process_recycler.as_mut(),
                     self.profile_creation_props.clone(),
-                ) {
+                );
+                self.task_initialized_sender.send(()).ok();
+                if let Ok(new_task) = new_task {
                     live_tasks.push(new_task);
                 } else {
                     // The task is probably already dead again. We get here for tasks which are

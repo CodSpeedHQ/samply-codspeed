@@ -27,6 +27,12 @@ pub struct JitCategoryManager {
     generic_jit_category: LazilyCreatedCategory,
 }
 
+impl Default for JitCategoryManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JitCategoryManager {
     /// (prefix, name, color, is_js)
     const CATEGORIES: &'static [(&'static str, Category<'static>, bool)] = &[

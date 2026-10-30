@@ -38,7 +38,7 @@ use super::injected_jit_object::{correct_bad_perf_jit_so_file, jit_function_name
 use super::kernel_symbols::{kernel_module_build_id, KernelSymbols};
 use super::mmap_range_or_vec::MmapRangeOrVec;
 use super::pe_mappings::{PeMappings, SuspectedPeMapping};
-use super::process::ExtraEventInstance;
+use super::process::{ExtraEventInstance, StackSnapshot, ThreadStackSnapshots};
 use super::processes::Processes;
 use super::rss_stat::{RssStat, MM_ANONPAGES, MM_FILEPAGES, MM_SHMEMPAGES, MM_SWAPENTS};
 use super::svma_file_range::compute_vma_bias;
@@ -693,12 +693,12 @@ where
         e: &SampleRecord,
         unwinder: &U,
         cache: &mut U::Cache,
-        stack_read_cache: &mut std::collections::HashMap<u64, u64>,
+        stack_read_cache: &mut HashMap<i32, ThreadStackSnapshots>,
         stack: &mut Vec<StackFrame>,
         fold_recursive_prefix: bool,
         call_chain_return_addresses_are_preadjusted: bool,
     ) {
-        stack.truncate(0);
+        stack.clear();
 
         // Parse e.callchain into kernel frames and user FP frames.
         let mut callchain_buf = Vec::new();
@@ -738,23 +738,33 @@ where
         if let (Some(regs), Some((user_stack, _))) = (&e.user_regs, e.user_stack) {
             let ustack_bytes = RawDataU64::from_raw_data::<LittleEndian>(user_stack);
             let (pc, sp, regs) = C::convert_regs(regs);
+            let sample_window = StackSnapshot {
+                sp,
+                // The current window is only used as the base of a
+                // continuation check. Its stable start is learned while
+                // unwinding and is set on the snapshot stored afterward.
+                stable_start: sp,
+                // The whole captured window: perf bounds it (at most ~64 KiB).
+                words: (0..ustack_bytes.len())
+                    .filter_map(|index| ustack_bytes.get(index))
+                    .collect(),
+            };
+            let mut stable_start = None;
+            // Without a tid we can't tell whose stack earlier words came from.
+            if let Some(cache) = e.tid.and_then(|tid| stack_read_cache.get_mut(&tid)) {
+                cache.retire_returned(sp);
+            }
+            let thread_cache = e.tid.and_then(|tid| stack_read_cache.get(&tid));
+            // The snapshots followed past the window, extended lazily by reads.
+            let mut chain = Vec::new();
             let mut read_stack = |addr: u64| {
-                // Prefer this sample's freshly captured stack window. ustack_bytes
-                // has the stack bytes starting from the current stack pointer.
-                if let Some(value) = addr
-                    .checked_sub(sp)
-                    .and_then(|offset| usize::try_from(offset / 8).ok())
-                    .and_then(|index| ustack_bytes.get(index))
-                {
-                    // Remember it: the upper stack is stable across samples, so a
-                    // later sample whose window doesn't reach this far can still
-                    // satisfy the read.
-                    stack_read_cache.insert(addr, value);
+                if let Some(value) = sample_window.get(addr) {
+                    stable_start = Some(stable_start.map_or(addr, |start: u64| start.min(addr)));
                     return Ok(value);
                 }
-                // The read is below sp or past the captured window. Fall back to
-                // a value seen in an earlier sample, if any.
-                stack_read_cache.get(&addr).copied().ok_or(())
+                thread_cache
+                    .and_then(|cache| cache.read_past(&sample_window, &mut chain, addr))
+                    .ok_or(())
             };
 
             // Unwind.
@@ -777,6 +787,15 @@ where
                     }
                 };
                 stack.push(stack_frame);
+            }
+            if let (Some(tid), Some(stable_start)) = (e.tid, stable_start) {
+                stack_read_cache
+                    .entry(tid)
+                    .or_default()
+                    .push(StackSnapshot {
+                        stable_start,
+                        ..sample_window
+                    });
             }
         }
 
@@ -1170,6 +1189,8 @@ where
             process
                 .threads
                 .remove_non_main_thread(e.tid, end_time, &mut self.profile);
+            // The tid may be reused by an unrelated thread.
+            process.stack_read_cache.remove(&e.tid);
         }
     }
 
@@ -1230,6 +1251,7 @@ where
             process
                 .threads
                 .remove_non_main_thread(e.tid, timestamp, &mut self.profile);
+            process.stack_read_cache.remove(&e.tid);
             process.recycle_or_get_new_thread(
                 e.tid,
                 Some(name.to_string()),
@@ -1509,10 +1531,9 @@ where
             }
         }
 
-        let name = match path.rfind('/') {
-            Some(pos) => path[pos + 1..].to_owned(),
-            None => path.clone(),
-        };
+        let name = Path::new(&path)
+            .file_name()
+            .map_or_else(|| path.clone(), |name| name.to_string_lossy().into_owned());
 
         let process = self.processes.get_by_pid(process_pid, &mut self.profile);
 
@@ -2136,5 +2157,169 @@ impl Marker for MmapMarker {
 
     fn field_values(&self) -> StringHandle {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use framehop::x86_64::{CacheX86_64, UnwinderX86_64};
+    use framehop::{ExplicitModuleSectionInfo, Module, Unwinder};
+    use linux_perf_data::linux_perf_event_reader;
+    use linux_perf_event_reader::constants::{PERF_CONTEXT_KERNEL, PERF_CONTEXT_USER};
+    use linux_perf_event_reader::{CpuMode, RawData, RawDataU64, SampleRecord};
+
+    use super::{Converter, MmapRangeOrVec};
+    use crate::linux_shared::convert_regs::ConvertRegsX86_64;
+    use crate::shared::types::{StackFrame, StackMode};
+
+    fn callchain_only_stack(
+        ip: u64,
+        cpu_mode: CpuMode,
+        callchain: Option<&[u64]>,
+    ) -> Vec<StackFrame> {
+        let callchain_bytes = callchain.map(|addresses| {
+            addresses
+                .iter()
+                .flat_map(|address| address.to_le_bytes())
+                .collect::<Vec<_>>()
+        });
+        let sample = SampleRecord {
+            id: None,
+            addr: None,
+            stream_id: None,
+            raw: None,
+            ip: Some(ip),
+            timestamp: None,
+            pid: Some(1),
+            tid: Some(1),
+            cpu: None,
+            period: None,
+            read: None,
+            user_regs: None,
+            user_stack: None,
+            callchain: callchain_bytes.as_ref().map(|bytes| {
+                RawDataU64::from_raw_data::<byteorder::LittleEndian>(RawData::Single(bytes))
+            }),
+            phys_addr: None,
+            data_page_size: None,
+            code_page_size: None,
+            intr_regs: None,
+            cpu_mode,
+        };
+
+        let mut unwinder = UnwinderX86_64::<MmapRangeOrVec>::new();
+        // Known code addresses keep root trimming from discarding valid FP frames.
+        unwinder.add_module(Module::new(
+            "test-module".to_string(),
+            0x1000..0x2000,
+            0x1000,
+            ExplicitModuleSectionInfo {
+                base_svma: 0,
+                text_svma: None,
+                text: None,
+                stubs_svma: None,
+                stub_helper_svma: None,
+                got_svma: None,
+                unwind_info: None,
+                eh_frame_svma: None,
+                eh_frame: None,
+                eh_frame_hdr_svma: None,
+                eh_frame_hdr: None,
+                debug_frame: None,
+                text_segment_svma: None,
+                text_segment: None,
+            },
+        ));
+        let mut stack = Vec::new();
+        Converter::<UnwinderX86_64<MmapRangeOrVec>>::get_sample_stack::<ConvertRegsX86_64>(
+            &sample,
+            &unwinder,
+            &mut CacheX86_64::new(),
+            &mut std::collections::HashMap::new(),
+            &mut stack,
+            false,
+            false,
+        );
+        stack
+    }
+
+    #[test]
+    fn fp_only_callchain_preserves_user_frame_order_without_duplicating_sampled_ip() {
+        let stack = callchain_only_stack(
+            0x1010,
+            CpuMode::User,
+            Some(&[PERF_CONTEXT_USER, 0x1010, 0x1020, 0x1030]),
+        );
+
+        assert_eq!(
+            stack,
+            vec![
+                StackFrame::InstructionPointer(0x1010, StackMode::User),
+                StackFrame::ReturnAddress(0x1020, StackMode::User),
+                StackFrame::ReturnAddress(0x1030, StackMode::User),
+            ]
+        );
+    }
+
+    #[test]
+    fn fp_only_callchain_preserves_kernel_to_user_context_transition() {
+        let kernel_ip = 0xffff_8000_0000_0010;
+        let kernel_caller = 0xffff_8000_0000_0020;
+        let stack = callchain_only_stack(
+            kernel_ip,
+            CpuMode::Kernel,
+            Some(&[
+                PERF_CONTEXT_KERNEL,
+                kernel_ip,
+                kernel_caller,
+                PERF_CONTEXT_USER,
+                0x1010,
+                0x1020,
+            ]),
+        );
+
+        assert_eq!(
+            stack,
+            vec![
+                StackFrame::InstructionPointer(kernel_ip, StackMode::Kernel),
+                StackFrame::ReturnAddress(kernel_caller, StackMode::Kernel),
+                StackFrame::ReturnAddress(0x1010, StackMode::User),
+                StackFrame::ReturnAddress(0x1020, StackMode::User),
+            ]
+        );
+    }
+
+    #[test]
+    fn fp_only_leaf_callchain_keeps_one_sampled_ip() {
+        let stack = callchain_only_stack(0x1010, CpuMode::User, Some(&[PERF_CONTEXT_USER, 0x1010]));
+
+        assert_eq!(
+            stack,
+            vec![StackFrame::InstructionPointer(0x1010, StackMode::User)]
+        );
+    }
+
+    #[test]
+    fn fp_only_empty_callchains_fall_back_to_sampled_ip() {
+        let callchains: [Option<&[u64]>; 3] = [None, Some(&[]), Some(&[PERF_CONTEXT_USER])];
+        for callchain in callchains {
+            let stack = callchain_only_stack(0x1010, CpuMode::User, callchain);
+
+            assert_eq!(
+                stack,
+                vec![StackFrame::InstructionPointer(0x1010, StackMode::User)],
+                "callchain: {callchain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fp_only_unmapped_leaf_callchain_falls_back_to_sampled_ip() {
+        let stack = callchain_only_stack(0x9000, CpuMode::User, Some(&[PERF_CONTEXT_USER, 0x9000]));
+
+        assert_eq!(
+            stack,
+            vec![StackFrame::InstructionPointer(0x9000, StackMode::User)]
+        );
     }
 }

@@ -4,7 +4,7 @@ use std::process::ExitStatus;
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{bounded, unbounded};
 use fxprof_processed_profile::Profile;
 
 use super::error::SamplingError;
@@ -76,9 +76,15 @@ pub fn run(
     };
 
     let (task_sender, task_receiver) = unbounded();
+    let (task_initialized_sender, task_initialized_receiver) = bounded(0);
 
     let sampler_thread = thread::spawn(move || {
-        let sampler = Sampler::new(task_receiver, recording_props, profile_creation_props);
+        let sampler = Sampler::new(
+            task_receiver,
+            task_initialized_sender,
+            recording_props,
+            profile_creation_props,
+        );
         sampler.run()
     });
 
@@ -108,8 +114,11 @@ pub fn run(
                         path_receiver,
                     }));
                     path_senders_per_pid.insert(pid, path_sender);
-                    if send_result.is_err() {
-                        // The sampler has already shut down. This task arrived too late.
+                    if send_result.is_ok() {
+                        // Keep the task suspended until the sampler has read its
+                        // initial threads and libraries; short-lived tasks can
+                        // otherwise exit before TaskProfiler::new finishes.
+                        task_initialized_receiver.recv().ok();
                     }
                     accepted_task.start_execution();
                 }

@@ -38,6 +38,12 @@ pub type ThreadRecycler = RecyclerByName<(ThreadHandle, StringHandle)>;
 
 pub struct RecyclerByName<T: Ord>(FastHashMap<String, BinaryHeap<Reverse<T>>>);
 
+impl<T: Ord> Default for RecyclerByName<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: Ord> RecyclerByName<T> {
     pub fn new() -> Self {
         Self(FastHashMap::default())
