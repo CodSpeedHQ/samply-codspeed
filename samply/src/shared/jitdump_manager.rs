@@ -358,7 +358,7 @@ mod test {
             let ops: Vec<usize> = queues
                 .into_iter()
                 .map(|queue| {
-                    let mut ops = queue.into_iter();
+                    let mut ops = queue.into_queue_iter();
                     std::iter::from_fn(|| ops.next_op_if_at_or_before(u64::MAX)).count()
                 })
                 .collect();
