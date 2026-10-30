@@ -2,12 +2,13 @@ use std::collections::VecDeque;
 use std::iter::{Cloned, Rev};
 
 use fxprof_processed_profile::{
-    FrameAddress, FrameFlags, FrameHandle, ProcessHandle, Profile, SubcategoryHandle,
+    Category, CategoryColor, FrameAddress, FrameFlags, FrameHandle, ProcessHandle, Profile,
+    SubcategoryHandle,
 };
 
 use super::jit_category_manager::{JsFrame, JsName};
 use super::lib_mappings::{AndroidArtInfo, LibMappingsHierarchy};
-use super::types::{StackFrame, StackMode};
+use super::types::{StackFrame, StackMarker, StackMode};
 
 #[derive(Debug)]
 pub struct StackConverter {
@@ -49,6 +50,7 @@ struct LibartFilteringIter<'c, I: Iterator<Item = SecondPassFrameInfo>> {
 struct ConvertedStackIterD<I: Iterator<Item = SecondPassFrameInfo>> {
     inner: I,
     pending_frame_handle: Option<FrameHandle>,
+    pending_marker: Option<StackMarker>,
     js_name_for_baseline_interpreter: Option<JsName>,
 }
 
@@ -70,20 +72,17 @@ impl<I: Iterator<Item = StackFrame>> Iterator for FirstPassIter<I> {
     }
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let frame = self.0.next()?;
-            let (mode, lookup_address, from_ip) = match frame {
-                StackFrame::InstructionPointer(addr, mode) => (mode, addr, true),
-                StackFrame::ReturnAddress(addr, mode) => (mode, addr.saturating_sub(1), false),
-                StackFrame::AdjustedReturnAddress(addr, mode) => (mode, addr, false),
-                StackFrame::TruncatedStackMarker => continue,
-            };
-            return Some(FirstPassFrameInfo {
-                mode,
-                lookup_address,
-                from_ip,
-            });
-        }
+        let (mode, lookup_address, from_ip) = match self.0.next()? {
+            StackFrame::InstructionPointer(addr, mode) => (mode, addr, true),
+            StackFrame::ReturnAddress(addr, mode) => (mode, addr.saturating_sub(1), false),
+            StackFrame::AdjustedReturnAddress(addr, mode) => (mode, addr, false),
+            StackFrame::StackMarker(_) => unreachable!("stack markers must be root-most"),
+        };
+        Some(FirstPassFrameInfo {
+            mode,
+            lookup_address,
+            from_ip,
+        })
     }
 }
 
@@ -196,16 +195,22 @@ impl<I: Iterator<Item = SecondPassFrameInfo>> Iterator for LibartFilteringIter<'
 
 impl<I: Iterator<Item = SecondPassFrameInfo>> ConvertedStackIterD<I> {
     fn size_hint(&self) -> (usize, Option<usize>) {
-        // Use the slice length as the size hint. This is a bit of a lie, unfortunately.
-        // This iterator can yield more elements than self.inner if we add JS frames,
-        // or fewer elements if the original iterator contains TruncatedStackMarker frames.
-        // But it's a relatively good approximation.
-        self.inner.size_hint()
+        // Approximate the converted depth for stack elision. JS frames can expand
+        // the stack and ART filtering can shrink it.
+        let pending =
+            self.pending_frame_handle.is_some() as usize + self.pending_marker.is_some() as usize;
+        let (lower, upper) = self.inner.size_hint();
+        (lower + pending, upper.map(|upper| upper + pending))
     }
 
     fn next(&mut self, profile: &mut Profile) -> Option<FrameHandle> {
         if let Some(pending_frame_handle) = self.pending_frame_handle.take() {
             return Some(pending_frame_handle);
+        }
+        if let Some(marker) = self.pending_marker.take() {
+            let category = profile.handle_for_category(Category("Unwinding", CategoryColor::Gray));
+            let label = profile.handle_for_string(marker.label());
+            return Some(profile.handle_for_frame_with_label(label, category, FrameFlags::empty()));
         }
         let SecondPassFrameInfo {
             location,
@@ -289,6 +294,14 @@ impl StackConverter {
         lib_mappings: &'a LibMappingsHierarchy,
         extra_first_frame: Option<FrameHandle>,
     ) -> ConvertedStackIter<'a> {
+        // Producers append markers after stack reconciliation. Keep the root marker
+        // outside JS/ART processing, immediately inside any extra label frame.
+        let (stack, pending_marker) = match stack.split_last() {
+            Some((StackFrame::StackMarker(marker), frames)) => {
+                (frames, (!frames.is_empty()).then_some(*marker))
+            }
+            _ => (stack, None),
+        };
         let pass1 = FirstPassIter(stack.iter().cloned().rev());
         let pass2 = SecondPassIter {
             inner: pass1,
@@ -306,8 +319,153 @@ impl StackConverter {
         let pass4 = ConvertedStackIterD {
             inner: pass3,
             pending_frame_handle: extra_first_frame,
+            pending_marker,
             js_name_for_baseline_interpreter: None,
         };
         ConvertedStackIter(pass4)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fxprof_processed_profile::{
+        Category, CategoryColor, CpuDelta, FrameFlags, ProcessHandle, Profile, ReferenceTimestamp,
+        SamplingInterval, SubcategoryHandle, ThreadHandle, Timestamp,
+    };
+    use serde_json::Value;
+
+    use super::super::lib_mappings::{LibMappingOpQueue, LibMappingsHierarchy};
+    use super::super::stack_depth_limiting_frame_iter::StackDepthLimitingFrameIter;
+    use super::super::types::{StackFrame, StackMarker, StackMode};
+    use super::StackConverter;
+
+    fn new_profile() -> (Profile, ProcessHandle, ThreadHandle, SubcategoryHandle) {
+        let mut profile = Profile::new(
+            "test",
+            ReferenceTimestamp::from_millis_since_unix_epoch(0.0),
+            SamplingInterval::from_millis(1),
+        );
+        let process = profile.add_process("test", 1, Timestamp::from_millis_since_reference(0.0));
+        let thread = profile.add_thread(
+            process,
+            1,
+            Timestamp::from_millis_since_reference(0.0),
+            true,
+        );
+        let user_category = profile
+            .handle_for_category(Category("User", CategoryColor::Blue))
+            .into();
+        (profile, process, thread, user_category)
+    }
+
+    fn serialized_stack_labels(profile: &Value, stack_index: usize) -> Vec<String> {
+        let shared = &profile["shared"];
+        let stack_table = &shared["stackTable"];
+        let frame_table = &shared["frameTable"];
+        let func_table = &shared["funcTable"];
+        let mut stack_index = Some(stack_index);
+        let mut labels = Vec::new();
+        while let Some(index) = stack_index {
+            let frame_index = stack_table["frame"][index].as_u64().unwrap() as usize;
+            let func_index = frame_table["func"][frame_index].as_u64().unwrap() as usize;
+            let name_index = func_table["name"][func_index].as_u64().unwrap() as usize;
+            labels.push(
+                shared["stringArray"][name_index]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+            stack_index = stack_table["prefix"][index]
+                .as_u64()
+                .map(|index| index as usize);
+        }
+        labels.reverse();
+        labels
+    }
+
+    #[test]
+    fn markers_are_preserved_as_distinct_root_labels() {
+        let (mut profile, process, thread, user_category) = new_profile();
+        let mappings = LibMappingsHierarchy::new(LibMappingOpQueue::default());
+        let mut converter = StackConverter::new(user_category, user_category);
+        let extra_label_string = profile.handle_for_string("sample");
+        let extra_label = profile.handle_for_frame_with_label(
+            extra_label_string,
+            user_category,
+            FrameFlags::empty(),
+        );
+        for (index, marker, extra) in [
+            (0, StackMarker::Truncated, Some(extra_label)),
+            (1, StackMarker::UnwindFailed, None),
+            (2, StackMarker::Truncated, None),
+        ] {
+            let frames = [
+                StackFrame::InstructionPointer(0x1234, StackMode::User),
+                StackFrame::StackMarker(marker),
+            ];
+            let mut converted = converter.convert_stack(process, &frames, &mappings, extra);
+            let stack_handle = profile.handle_for_stack_frames(|profile| converted.next(profile));
+            profile.add_sample(
+                thread,
+                Timestamp::from_millis_since_reference(index as f64),
+                stack_handle,
+                CpuDelta::ZERO,
+                (index + 1) as i32,
+            );
+        }
+        let ordinary_frames = [StackFrame::InstructionPointer(0x1234, StackMode::User)];
+        let mut ordinary = converter.convert_stack(process, &ordinary_frames, &mappings, None);
+        let ordinary_stack = profile.handle_for_stack_frames(|profile| ordinary.next(profile));
+        profile.add_sample(
+            thread,
+            Timestamp::from_millis_since_reference(3.0),
+            ordinary_stack,
+            CpuDelta::ZERO,
+            4,
+        );
+
+        let serialized = serde_json::to_value(&profile).unwrap();
+        let thread_json = &serialized["threads"][0];
+        let samples = &thread_json["samples"];
+        let sample_stacks = samples["stack"].as_array().unwrap();
+        let labels: Vec<_> = sample_stacks
+            .iter()
+            .map(|stack| serialized_stack_labels(&serialized, stack.as_u64().unwrap() as usize))
+            .collect();
+        assert_eq!(labels[0], ["sample", "[truncated]", "0x1234"]);
+        assert_eq!(labels[1], ["[unwind_failed]", "0x1234"]);
+        assert_eq!(labels[2], ["[truncated]", "0x1234"]);
+        assert_eq!(labels[3], ["0x1234"]);
+    }
+
+    #[test]
+    fn deep_stack_elision_preserves_the_diagnostic_root() {
+        let (mut profile, process, thread, user_category) = new_profile();
+        let mappings = LibMappingsHierarchy::new(LibMappingOpQueue::default());
+        let mut converter = StackConverter::new(user_category, user_category);
+        let mut frames: Vec<_> = (0..502)
+            .map(|address| StackFrame::InstructionPointer(address as u64, StackMode::User))
+            .collect();
+        frames.push(StackFrame::StackMarker(StackMarker::Truncated));
+        let converted = converter.convert_stack(process, &frames, &mappings, None);
+        let mut converted =
+            StackDepthLimitingFrameIter::new(&mut profile, converted, user_category);
+        let stack_handle = profile.handle_for_stack_frames(|profile| converted.next(profile));
+        profile.add_sample(
+            thread,
+            Timestamp::from_millis_since_reference(0.0),
+            stack_handle,
+            CpuDelta::ZERO,
+            1,
+        );
+
+        let serialized = serde_json::to_value(&profile).unwrap();
+        let stack_index = serialized["threads"][0]["samples"]["stack"][0]
+            .as_u64()
+            .unwrap() as usize;
+        let labels = serialized_stack_labels(&serialized, stack_index);
+        assert_eq!(labels.first().map(String::as_str), Some("[truncated]"));
+        assert!(labels.iter().any(|label| label.contains("frames elided")));
+        assert_eq!(labels.last().map(String::as_str), Some("0x0"));
     }
 }

@@ -38,11 +38,26 @@ impl From<CpuMode> for StackMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StackMarker {
+    Truncated,
+    UnwindFailed,
+}
+
+impl StackMarker {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Truncated => "[truncated]",
+            Self::UnwindFailed => "[unwind_failed]",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StackFrame {
     InstructionPointer(u64, StackMode),
     ReturnAddress(u64, StackMode),
     AdjustedReturnAddress(u64, StackMode),
-    TruncatedStackMarker,
+    StackMarker(StackMarker),
 }
 
 impl StackFrame {
@@ -51,7 +66,7 @@ impl StackFrame {
             StackFrame::InstructionPointer(addr, _) => addr,
             StackFrame::ReturnAddress(addr, _) => addr,
             StackFrame::AdjustedReturnAddress(addr, _) => addr,
-            StackFrame::TruncatedStackMarker => 0,
+            StackFrame::StackMarker(_) => 0,
         }
     }
 
@@ -60,7 +75,7 @@ impl StackFrame {
             StackFrame::InstructionPointer(_, stack_mode) => Some(stack_mode),
             StackFrame::ReturnAddress(_, stack_mode) => Some(stack_mode),
             StackFrame::AdjustedReturnAddress(_, stack_mode) => Some(stack_mode),
-            StackFrame::TruncatedStackMarker => None,
+            StackFrame::StackMarker(_) => None,
         }
     }
 

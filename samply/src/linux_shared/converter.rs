@@ -55,7 +55,7 @@ use crate::shared::process_sample_data::{
 use crate::shared::prop_types::ProfileCreationProps;
 use crate::shared::synthetic_jit_library::SyntheticJitLibrary;
 use crate::shared::timestamp_converter::TimestampConverter;
-use crate::shared::types::{StackFrame, StackMode};
+use crate::shared::types::{StackFrame, StackMarker, StackMode};
 use crate::shared::unresolved_samples::{
     UnresolvedSamples, UnresolvedStackHandle, UnresolvedStacks,
 };
@@ -700,6 +700,24 @@ where
     ) {
         stack.clear();
 
+        // Frame-pointer unwinding (framehop's fallback for code without
+        // `.eh_frame`, and the kernel's FP callchain) can mistake a stack-local
+        // value for a saved return address. A genuine code address always lies
+        // in a known module, so trim trailing user frames from the root inward
+        // until one does (or we hit a non-user frame).
+        let trim_unmapped_root = |stack: &mut Vec<StackFrame>| {
+            while let Some(last) = stack.last() {
+                if last.stack_mode() != Some(StackMode::User) {
+                    break;
+                }
+                let addr = last.address();
+                if addr != 0 && !unwinder.is_address_in_module(addr) {
+                    stack.pop();
+                } else {
+                    break;
+                }
+            }
+        };
         // Parse e.callchain into kernel frames and user FP frames.
         let mut callchain_buf = Vec::new();
         let mut callchain_kernel_len = 0;
@@ -727,13 +745,14 @@ where
             }
             callchain_kernel_len = callchain_buf.iter().take_while(|f| f.is_kernel()).count();
         }
+        trim_unmapped_root(&mut callchain_buf);
         let (kernel_frames, fp_user_frames) = callchain_buf.split_at(callchain_kernel_len);
 
         // Start with kernel frames from the callchain.
         stack.extend_from_slice(kernel_frames);
 
         // Append the user stack with the help of DWARF unwinding.
-        let mut dwarf_truncated = false;
+        let mut dwarf_marker = None;
         let dwarf_start = stack.len();
         if let (Some(regs), Some((user_stack, _))) = (&e.user_regs, e.user_stack) {
             let ustack_bytes = RawDataU64::from_raw_data::<LittleEndian>(user_stack);
@@ -773,8 +792,15 @@ where
                 let frame = match frames.next() {
                     Ok(Some(frame)) => frame,
                     Ok(None) => break,
-                    Err(_) => {
-                        dwarf_truncated = true;
+                    Err(error) => {
+                        dwarf_marker = Some(match error {
+                            framehop::Error::CouldNotReadStack(addr)
+                                if addr >= sample_window.end() =>
+                            {
+                                StackMarker::Truncated
+                            }
+                            _ => StackMarker::UnwindFailed,
+                        });
                         break;
                     }
                 };
@@ -798,25 +824,7 @@ where
                     });
             }
         }
-
-        // Frame-pointer unwinding (framehop's fallback for code without
-        // `.eh_frame`, and the kernel's FP callchain) can mistake a stack-local
-        // value for a saved return address. A genuine code address always lies
-        // in a known module, so trim trailing user frames from the root inward
-        // until one does (or we hit a non-user frame).
-        let trim_unmapped_root = |stack: &mut Vec<StackFrame>| {
-            while let Some(last) = stack.last() {
-                if last.stack_mode() != Some(StackMode::User) {
-                    break;
-                }
-                let addr = last.address();
-                if addr != 0 && !unwinder.is_address_in_module(addr) {
-                    stack.pop();
-                } else {
-                    break;
-                }
-            }
-        };
+        trim_unmapped_root(stack);
 
         // Reconcile the DWARF stack against the user portion of the kernel's FP
         // callchain. The two can disagree because DWARF unwinding falls back to
@@ -841,24 +849,15 @@ where
                 .zip(fp_user_frames.iter())
                 .take_while(|(a, b)| a.address() == b.address())
                 .count();
-            if common == dwarf_len {
-                stack.extend_from_slice(&fp_user_frames[common..]);
-            } else if fp_user_frames.len() > dwarf_len && common >= 1 {
+            if fp_user_frames.len() > dwarf_len && (common == dwarf_len || common >= 1) {
                 stack.truncate(dwarf_start + common);
                 stack.extend_from_slice(&fp_user_frames[common..]);
+                dwarf_marker = None;
             }
-        } else if dwarf_truncated || stack.len() == dwarf_start {
-            // No usable callchain. Use what little we have, or mark truncation.
-            if stack.len() == dwarf_start && !fp_user_frames.is_empty() {
-                stack.extend_from_slice(fp_user_frames);
-            } else if dwarf_truncated {
-                stack.push(StackFrame::TruncatedStackMarker);
-            }
+        } else if stack.len() == dwarf_start && !fp_user_frames.is_empty() {
+            stack.extend_from_slice(fp_user_frames);
+            dwarf_marker = None;
         }
-
-        // The callchain frames appended above weren't run through DWARF, so an FP
-        // root can still slip in; trim trailing frames outside any known module.
-        trim_unmapped_root(&mut *stack);
 
         if stack.is_empty() {
             if let Some(ip) = e.ip {
@@ -868,6 +867,13 @@ where
             let last_frame = *stack.last().unwrap();
             while stack.len() >= 2 && stack[stack.len() - 2] == last_frame {
                 stack.pop();
+            }
+        }
+
+        // Mark only the final stack, after FP reconciliation and root trimming.
+        if !stack.is_empty() {
+            if let Some(marker) = dwarf_marker {
+                stack.push(StackFrame::StackMarker(marker));
             }
         }
     }
@@ -2157,5 +2163,175 @@ impl Marker for MmapMarker {
 
     fn field_values(&self) -> StringHandle {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use framehop::x86_64::{CacheX86_64, UnwinderX86_64};
+    use linux_perf_event_reader::{CpuMode, RawData, Regs};
+
+    use super::*;
+    use crate::linux_shared::convert_regs::ConvertRegsX86_64;
+
+    const SP: u64 = 0x1000;
+    const IP: u64 = 0x5000;
+    const CALLER: u64 = 0x6000;
+    const ROOT: u64 = 0x7000;
+
+    fn sample_stack(bp: u64, words: &[u64], callchain: &[u64]) -> Vec<StackFrame> {
+        let bytes = |words: &[u64]| {
+            words
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect::<Vec<_>>()
+        };
+        // PERF_REG_X86_BP, SP, IP are consecutive in this order.
+        let registers = bytes(&[bp, SP, IP]);
+        let stack_bytes = bytes(words);
+        let callchain_bytes = bytes(callchain);
+        let sample = SampleRecord {
+            id: None,
+            addr: None,
+            stream_id: None,
+            raw: None,
+            ip: Some(IP),
+            timestamp: Some(0),
+            pid: Some(1),
+            tid: Some(1),
+            cpu: None,
+            period: None,
+            read: None,
+            user_regs: Some(Regs::new(
+                ConvertRegsX86_64::regs_mask(),
+                RawDataU64::from_raw_data::<LittleEndian>(RawData::Single(&registers)),
+            )),
+            user_stack: Some((RawData::Single(&stack_bytes), stack_bytes.len() as u64)),
+            callchain: Some(RawDataU64::from_raw_data::<LittleEndian>(RawData::Single(
+                &callchain_bytes,
+            ))),
+            phys_addr: None,
+            data_page_size: None,
+            code_page_size: None,
+            intr_regs: None,
+            cpu_mode: CpuMode::User,
+        };
+        let mut unwinder = UnwinderX86_64::new();
+        unwinder.add_module(Module::new(
+            "test".into(),
+            0x4000..0x8000,
+            0x4000,
+            ExplicitModuleSectionInfo {
+                base_svma: 0x4000,
+                text_svma: None,
+                text: None,
+                stubs_svma: None,
+                stub_helper_svma: None,
+                got_svma: None,
+                unwind_info: None,
+                eh_frame_svma: None,
+                eh_frame: None,
+                eh_frame_hdr_svma: None,
+                eh_frame_hdr: None,
+                debug_frame: None,
+                text_segment_svma: None,
+                text_segment: None,
+            },
+        ));
+        let mut stack = Vec::new();
+        Converter::<UnwinderX86_64<MmapRangeOrVec>>::get_sample_stack::<ConvertRegsX86_64>(
+            &sample,
+            &unwinder,
+            &mut CacheX86_64::new(),
+            &mut HashMap::new(),
+            &mut stack,
+            true,
+            false,
+        );
+        stack
+    }
+
+    fn ip() -> StackFrame {
+        StackFrame::InstructionPointer(IP, StackMode::User)
+    }
+
+    fn caller() -> StackFrame {
+        StackFrame::ReturnAddress(CALLER, StackMode::User)
+    }
+
+    #[test]
+    fn capture_exhaustion_is_distinct_from_invalid_unwinding() {
+        assert_eq!(
+            sample_stack(SP, &[SP + 16, CALLER], &[]),
+            vec![
+                ip(),
+                caller(),
+                StackFrame::StackMarker(StackMarker::Truncated)
+            ]
+        );
+        // A read below the captured stack is not capture exhaustion.
+        assert_eq!(
+            sample_stack(SP - 8, &[], &[]),
+            vec![ip(), StackFrame::StackMarker(StackMarker::UnwindFailed)]
+        );
+        // A backwards frame pointer fails without a memory read.
+        assert_eq!(
+            sample_stack(SP - 16, &[], &[]),
+            vec![ip(), StackFrame::StackMarker(StackMarker::UnwindFailed)]
+        );
+        assert_eq!(sample_stack(SP, &[0, CALLER], &[]), vec![ip(), caller()]);
+    }
+
+    #[test]
+    fn fp_extension_resolves_dwarf_failure_but_equal_callchain_does_not() {
+        assert_eq!(
+            sample_stack(SP, &[SP + 16, CALLER], &[IP, CALLER, ROOT]),
+            vec![
+                ip(),
+                caller(),
+                StackFrame::ReturnAddress(ROOT, StackMode::User)
+            ]
+        );
+        assert_eq!(
+            sample_stack(SP, &[SP + 16, CALLER], &[IP, ROOT, CALLER]),
+            vec![
+                ip(),
+                StackFrame::ReturnAddress(ROOT, StackMode::User),
+                caller()
+            ]
+        );
+        assert_eq!(
+            sample_stack(SP, &[SP + 16, CALLER], &[IP, CALLER]),
+            vec![
+                ip(),
+                caller(),
+                StackFrame::StackMarker(StackMarker::Truncated)
+            ]
+        );
+    }
+
+    #[test]
+    fn diagnostic_markers_do_not_block_root_trimming_or_recursion_folding() {
+        const UNMAPPED_ADDRESS: u64 = 0xdead;
+        assert_eq!(
+            sample_stack(SP, &[SP + 16, UNMAPPED_ADDRESS], &[]),
+            vec![ip(), StackFrame::StackMarker(StackMarker::Truncated)]
+        );
+        assert_eq!(
+            sample_stack(SP, &[SP + 16, CALLER], &[IP, CALLER, UNMAPPED_ADDRESS]),
+            vec![
+                ip(),
+                caller(),
+                StackFrame::StackMarker(StackMarker::Truncated)
+            ]
+        );
+        assert_eq!(
+            sample_stack(SP, &[SP + 16, CALLER, SP + 32, CALLER], &[]),
+            vec![
+                ip(),
+                caller(),
+                StackFrame::StackMarker(StackMarker::Truncated)
+            ]
+        );
     }
 }
