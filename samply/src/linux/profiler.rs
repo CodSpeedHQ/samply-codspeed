@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::ops::Deref;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -39,7 +40,7 @@ pub fn run(
     recording_mode: RecordingMode,
     recording_props: RecordingProps,
     profile_creation_props: ProfileCreationProps,
-) -> Result<(Profile, ExitStatus), ()> {
+) -> Result<(Profile, ExitStatus), Infallible> {
     let process_launch_props = match recording_mode {
         RecordingMode::All => {
             // TODO: Implement, by sudo launching a helper process which opens cpu-wide perf events
