@@ -16,6 +16,16 @@ On Linux, samply uses perf events. You can grant temporary access by running:
 echo '-1' | sudo tee /proc/sys/kernel/perf_event_paranoid
 ```
 
+On Linux, use `--unwinding-mode fp` to record kernel frame-pointer callchains without copying user stack bytes or registers:
+
+```sh
+samply record --unwinding-mode fp ./my-application my-arguments
+```
+
+The default, `--unwinding-mode dwarf`, keeps stack/register capture and framehop unwinding with the kernel frame-pointer callchain as a fallback.
+
+Frame-pointer recording requires the application and its libraries to preserve frame pointers. For Rust, build with `RUSTFLAGS="-C force-frame-pointers=yes"`; for C/C++, use `-fno-omit-frame-pointer -mno-omit-leaf-frame-pointer`. Missing frame pointers can truncate the stack. Kernel callchain support depends on the target architecture and kernel, and callchain depth is bounded by `/proc/sys/kernel/perf_event_max_stack`.
+
 On Windows, you can use `samply record -a` to record all processes. You'll usually also want to use some symbol servers, most importantly the Microsoft Symbol Server so that you can see symbols for Windows libraries. Here's a command which supports symbols for Windows, Firefox and Chrome:
 
 ```
