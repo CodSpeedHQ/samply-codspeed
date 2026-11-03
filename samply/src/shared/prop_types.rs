@@ -25,6 +25,16 @@ impl CoreClrProfileProps {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnwindingMode {
+    Fp,
+    Dwarf(Option<u32>),
+}
+
+/// Default bytes of user stack copied per sample for DWARF unwinding.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub const DEFAULT_UNWINDING_STACK_SIZE: u32 = 32_000;
+
 /// Properties which are meaningful both for recording a fresh process
 /// as well as for recording an existing process.
 #[derive(Debug, Clone)]
@@ -33,6 +43,8 @@ pub struct RecordingProps {
     pub output_file: PathBuf,
     pub time_limit: Option<Duration>,
     pub interval: Duration,
+    #[allow(dead_code)] // Only used on Linux and Android
+    pub unwinding_mode: UnwindingMode,
     /// Names of extra perf events to record alongside the main sampling
     /// event. Only used on Linux.
     #[allow(dead_code)]

@@ -10,7 +10,7 @@ use super::server::{PortSelection, ServerProps};
 use super::shared::included_processes::IncludedProcesses;
 use super::shared::prop_types::{
     CoreClrProfileProps, ImportProps, ProcessLaunchProps, ProfileCreationProps, RecordingMode,
-    RecordingProps, SymbolProps,
+    RecordingProps, SymbolProps, UnwindingMode,
 };
 
 #[derive(Debug, Parser)]
@@ -132,6 +132,14 @@ pub struct RecordArgs {
     /// Sampling rate, in Hz
     #[arg(short, long, default_value = "1000")]
     pub rate: f64,
+
+    /// Stack unwinding on Linux: `fp`, `dwarf`, or `dwarf,<bytes>`.
+    /// `fp` requires binaries compiled with frame pointers.
+    /// `dwarf` copies 32000 bytes of user stack per sample by default.
+    /// An explicit size must be a non-zero multiple of 8 below 65536.
+    #[cfg(target_os = "linux")]
+    #[arg(long, default_value = "dwarf", value_parser = parse_unwinding_mode)]
+    pub unwinding_mode: UnwindingMode,
 
     /// Limit the recorded time to the specified number of seconds
     #[arg(short, long)]
@@ -456,6 +464,10 @@ impl RecordArgs {
             output_file: self.output.clone(),
             time_limit,
             interval,
+            #[cfg(target_os = "linux")]
+            unwinding_mode: self.unwinding_mode,
+            #[cfg(not(target_os = "linux"))]
+            unwinding_mode: UnwindingMode::Dwarf(None),
             perf_events,
             gfx: self.gfx,
             browsers: self.browsers,
@@ -614,6 +626,34 @@ impl SymbolArgs {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn parse_unwinding_mode(value: &str) -> Result<UnwindingMode, String> {
+    const FRAME_POINTER_UNWINDING: &str = "fp";
+    const DWARF_UNWINDING: &str = "dwarf";
+
+    let (mode, stack_size) = match value.split_once(',') {
+        Some((mode, size)) => {
+            let size: u32 = size
+                .parse()
+                .map_err(|e| format!("Invalid stack size `{size}`: {e}"))?;
+            // The kernel requires sample_stack_user to be 8-byte aligned and fit in a u16.
+            if size == 0 || size % 8 != 0 || size > u32::from(u16::MAX) {
+                return Err("must be a non-zero multiple of 8 below 65536".into());
+            }
+            (mode, Some(size))
+        }
+        None => (value, None),
+    };
+    match (mode, stack_size) {
+        (DWARF_UNWINDING, stack_size) => Ok(UnwindingMode::Dwarf(stack_size)),
+        (FRAME_POINTER_UNWINDING, None) => Ok(UnwindingMode::Fp),
+        (FRAME_POINTER_UNWINDING, Some(_)) => {
+            Err("A stack size only applies to `dwarf` unwinding".into())
+        }
+        _ => Err("Expected `fp`, `dwarf`, or `dwarf,<bytes>`".into()),
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -647,5 +687,60 @@ mod test {
         // Make sure you can't pass both a pid and a command name at the same time.
         let opt_res = Opt::try_parse_from(["samply", "record", "-p", "1234", "rustup"]);
         assert!(opt_res.is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn record_fp_unwinding_with_launched_command() {
+        let opt = Opt::try_parse_from([
+            "samply",
+            "record",
+            "--unwinding-mode",
+            "fp",
+            "rustup",
+            "--version",
+        ])
+        .unwrap();
+        let Action::Record(args) = opt.action else {
+            panic!("expected record action");
+        };
+        assert_eq!(args.recording_props().unwinding_mode, UnwindingMode::Fp);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn record_unwinding_stack_size() {
+        let parse = |mode: &str| {
+            Opt::try_parse_from([
+                "samply",
+                "record",
+                "--unwinding-mode",
+                mode,
+                "--pid",
+                "1234",
+            ])
+        };
+        for (mode, expected) in [
+            ("dwarf", UnwindingMode::Dwarf(None)),
+            ("dwarf,8", UnwindingMode::Dwarf(Some(8))),
+            ("dwarf,65528", UnwindingMode::Dwarf(Some(65528))),
+        ] {
+            let Action::Record(args) = parse(mode).unwrap().action else {
+                panic!("expected record action");
+            };
+            assert_eq!(args.recording_props().unwinding_mode, expected);
+        }
+        for invalid in [
+            "dwarf,0",
+            "dwarf,1001",
+            "dwarf,65536",
+            "dwarf,",
+            "dwarf,8,16",
+            "fp,8",
+            "unsupported",
+        ] {
+            let error = parse(invalid).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        }
     }
 }
