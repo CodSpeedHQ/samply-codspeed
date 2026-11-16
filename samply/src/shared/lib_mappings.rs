@@ -1,6 +1,7 @@
 use std::iter::Peekable;
+use std::sync::Arc;
 
-use fxprof_processed_profile::{LibMappings, LibraryHandle, SubcategoryHandle};
+use fxprof_processed_profile::{LibMappings, LibraryHandle, StringHandle, SubcategoryHandle};
 
 use super::jit_category_manager::JsFrame;
 
@@ -10,6 +11,20 @@ pub struct LibMappingInfo {
     pub category: Option<SubcategoryHandle>,
     pub js_frame: Option<JsFrame>,
     pub art_info: Option<AndroidArtInfo>,
+    pub inlined_frames: Option<Arc<InlinedFrames>>,
+}
+
+/// The functions that a JIT compiler inlined into the code covered by a mapping.
+#[derive(Debug)]
+pub struct InlinedFrames {
+    /// The library of the JIT function containing the mapping.
+    pub function_lib: LibraryHandle,
+    /// The address of that function, relative to its library.
+    pub function_relative_address: u32,
+    pub function_size: u32,
+    pub function_name: StringHandle,
+    /// The names of the inlined functions, outermost first.
+    pub names: Box<[StringHandle]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +44,7 @@ impl LibMappingInfo {
             category: None,
             js_frame: None,
             art_info: None,
+            inlined_frames: None,
         }
     }
 
@@ -39,6 +55,7 @@ impl LibMappingInfo {
             category: Some(category),
             js_frame: None,
             art_info: None,
+            inlined_frames: None,
         }
     }
 
@@ -52,6 +69,19 @@ impl LibMappingInfo {
             category: Some(category),
             js_frame,
             art_info: None,
+            inlined_frames: None,
+        }
+    }
+
+    pub fn new_jit_inlined_range(
+        lib_handle: LibraryHandle,
+        category: SubcategoryHandle,
+        js_frame: Option<JsFrame>,
+        inlined_frames: InlinedFrames,
+    ) -> Self {
+        Self {
+            inlined_frames: Some(Arc::new(inlined_frames)),
+            ..Self::new_jit_function(lib_handle, category, js_frame)
         }
     }
 
@@ -61,6 +91,7 @@ impl LibMappingInfo {
             category: None,
             js_frame: None,
             art_info: Some(AndroidArtInfo::LibArt),
+            inlined_frames: None,
         }
     }
 
@@ -73,6 +104,7 @@ impl LibMappingInfo {
             category,
             js_frame: None,
             art_info: Some(AndroidArtInfo::JavaFrame),
+            inlined_frames: None,
         }
     }
 }

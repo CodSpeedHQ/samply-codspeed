@@ -1,12 +1,14 @@
 use std::collections::VecDeque;
 use std::iter::{Cloned, Rev};
+use std::sync::Arc;
 
 use fxprof_processed_profile::{
-    FrameAddress, FrameFlags, FrameHandle, ProcessHandle, Profile, SubcategoryHandle,
+    FrameAddress, FrameFlags, FrameHandle, FrameSymbolInfo, ProcessHandle, Profile, SourceLocation,
+    SubcategoryHandle,
 };
 
 use super::jit_category_manager::{JsFrame, JsName};
-use super::lib_mappings::{AndroidArtInfo, LibMappingsHierarchy};
+use super::lib_mappings::{AndroidArtInfo, InlinedFrames, LibMappingsHierarchy};
 use super::types::{StackFrame, StackMode};
 
 #[derive(Debug)]
@@ -28,6 +30,51 @@ struct SecondPassFrameInfo {
     category: SubcategoryHandle,
     js_frame: Option<JsFrame>,
     art_info: Option<AndroidArtInfo>,
+    inlined_frames: Option<Arc<InlinedFrames>>,
+}
+
+/// The inlined frames of a native frame which still have to be yielded.
+struct PendingInlinedFrames {
+    location: FrameAddress,
+    category: SubcategoryHandle,
+    frame_flags: FrameFlags,
+    inlined_frames: Arc<InlinedFrames>,
+    next_index: usize,
+}
+
+impl PendingInlinedFrames {
+    fn next(&mut self, profile: &mut Profile) -> Option<FrameHandle> {
+        let InlinedFrames {
+            function_lib,
+            function_relative_address,
+            function_size,
+            function_name,
+            ref names,
+        } = *self.inlined_frames;
+        let name = *names.get(self.next_index)?;
+        self.next_index += 1;
+
+        let native_symbol = profile.handle_for_native_symbol(
+            function_lib,
+            function_relative_address,
+            Some(function_size),
+            function_name,
+        );
+        let symbol_info = FrameSymbolInfo {
+            name: Some(name),
+            native_symbol,
+            source_location: SourceLocation::default(),
+        };
+        // The JIT function itself is the frame at depth zero.
+        let inline_depth = self.next_index as u16;
+        Some(profile.handle_for_frame_with_address_and_symbol(
+            self.location.clone(),
+            symbol_info,
+            inline_depth,
+            self.category,
+            self.frame_flags,
+        ))
+    }
 }
 
 struct FirstPassIter<I: Iterator<Item = StackFrame>>(I);
@@ -49,6 +96,7 @@ struct LibartFilteringIter<'c, I: Iterator<Item = SecondPassFrameInfo>> {
 struct ConvertedStackIterD<I: Iterator<Item = SecondPassFrameInfo>> {
     inner: I,
     pending_frame_handle: Option<FrameHandle>,
+    pending_inlined_frames: Option<PendingInlinedFrames>,
     js_name_for_baseline_interpreter: Option<JsName>,
 }
 
@@ -100,7 +148,7 @@ impl<I: Iterator<Item = FirstPassFrameInfo>> Iterator for SecondPassIter<'_, I> 
             lookup_address,
             from_ip,
         } = self.inner.next()?;
-        let (location, category, js_frame, art_info) = match mode {
+        let (location, category, js_frame, art_info, inlined_frames) = match mode {
             StackMode::User => match self.lib_mappings.convert_address(lookup_address) {
                 Some((relative_lookup_address, info)) => {
                     let location = if from_ip {
@@ -120,6 +168,7 @@ impl<I: Iterator<Item = FirstPassFrameInfo>> Iterator for SecondPassIter<'_, I> 
                         info.category.unwrap_or(self.user_category),
                         info.js_frame,
                         info.art_info,
+                        info.inlined_frames.clone(),
                     )
                 }
                 None => {
@@ -128,7 +177,7 @@ impl<I: Iterator<Item = FirstPassFrameInfo>> Iterator for SecondPassIter<'_, I> 
                         true => FrameAddress::InstructionPointer(p, lookup_address),
                         false => FrameAddress::AdjustedReturnAddress(p, lookup_address),
                     };
-                    (location, self.user_category, None, None)
+                    (location, self.user_category, None, None, None)
                 }
             },
             StackMode::Kernel => {
@@ -136,7 +185,7 @@ impl<I: Iterator<Item = FirstPassFrameInfo>> Iterator for SecondPassIter<'_, I> 
                     true => FrameAddress::KernelInstructionPointer(lookup_address),
                     false => FrameAddress::KernelAdjustedReturnAddress(lookup_address),
                 };
-                (location, self.kernel_category, None, None)
+                (location, self.kernel_category, None, None, None)
             }
         };
         Some(SecondPassFrameInfo {
@@ -144,6 +193,7 @@ impl<I: Iterator<Item = FirstPassFrameInfo>> Iterator for SecondPassIter<'_, I> 
             category,
             js_frame,
             art_info,
+            inlined_frames,
         })
     }
 }
@@ -207,10 +257,17 @@ impl<I: Iterator<Item = SecondPassFrameInfo>> ConvertedStackIterD<I> {
         if let Some(pending_frame_handle) = self.pending_frame_handle.take() {
             return Some(pending_frame_handle);
         }
+        if let Some(pending_inlined_frames) = &mut self.pending_inlined_frames {
+            if let Some(frame_handle) = pending_inlined_frames.next(profile) {
+                return Some(frame_handle);
+            }
+            self.pending_inlined_frames = None;
+        }
         let SecondPassFrameInfo {
             location,
             category,
             js_frame,
+            inlined_frames,
             ..
         } = self.inner.next()?;
 
@@ -246,7 +303,14 @@ impl<I: Iterator<Item = SecondPassFrameInfo>> ConvertedStackIterD<I> {
         };
 
         let mut frame_handle =
-            profile.handle_for_frame_with_address(location, category, frame_flags);
+            profile.handle_for_frame_with_address(location.clone(), category, frame_flags);
+        self.pending_inlined_frames = inlined_frames.map(|inlined_frames| PendingInlinedFrames {
+            location,
+            category,
+            frame_flags,
+            inlined_frames,
+            next_index: 0,
+        });
         if let Some(JsName::NonSelfHosted(js_name)) = extra_js_name {
             // Prepend a JS frame.
             // We don't treat Spidermonkey "self-hosted" functions as JS (e.g. filter/map/push).
@@ -306,6 +370,7 @@ impl StackConverter {
         let pass4 = ConvertedStackIterD {
             inner: pass3,
             pending_frame_handle: extra_first_frame,
+            pending_inlined_frames: None,
             js_name_for_baseline_interpreter: None,
         };
         ConvertedStackIter(pass4)
