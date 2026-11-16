@@ -1,11 +1,76 @@
 use std::sync::Arc;
 
 use debugid::DebugId;
-use fxprof_processed_profile::{LibMappings, LibraryInfo, Profile, Symbol, SymbolTable};
+use fxprof_processed_profile::{
+    LibMappings, LibraryHandle, LibraryInfo, Profile, StringHandle, SubcategoryHandle, Symbol,
+    SymbolTable,
+};
 
-use super::jit_category_manager::JitCategoryManager;
+use super::jit_category_manager::{JitCategoryManager, JsFrame};
 use super::jit_function_recycler::JitFunctionRecycler;
-use super::lib_mappings::LibMappingInfo;
+use super::lib_mappings::{InlinedFrames, LibMappingInfo};
+
+/// Separates the functions of an inline stack in a symbol name, outermost function first.
+///
+/// This is the convention of perf-map-agent's `unfoldall` option.
+const INLINE_FRAME_SEPARATOR: &str = "->";
+
+/// The most recent JIT function of the perf map.
+///
+/// An entry that lies within this function and whose name starts with the function name
+/// followed by [`INLINE_FRAME_SEPARATOR`] describes a code range that the JIT compiler
+/// inlined from other functions.
+struct JitFunction<'a> {
+    start_address: u64,
+    end_address: u64,
+    name: &'a str,
+    name_handle: StringHandle,
+    lib_handle: LibraryHandle,
+    relative_address: u32,
+    category: SubcategoryHandle,
+    js_frame: Option<JsFrame>,
+}
+
+impl<'a> JitFunction<'a> {
+    /// Returns the names of the functions inlined into `start_address..end_address`,
+    /// outermost first, if `symbol_name` is an inline stack of this function.
+    fn inlined_names(
+        &self,
+        start_address: u64,
+        end_address: u64,
+        symbol_name: &'a str,
+    ) -> Option<impl Iterator<Item = &'a str>> {
+        if start_address < self.start_address || end_address > self.end_address {
+            return None;
+        }
+        let inlined_names = symbol_name
+            .strip_prefix(self.name)?
+            .strip_prefix(INLINE_FRAME_SEPARATOR)?;
+        Some(inlined_names.split(INLINE_FRAME_SEPARATOR))
+    }
+
+    fn inlined_range_info(
+        &self,
+        inlined_names: impl Iterator<Item = &'a str>,
+        profile: &mut Profile,
+    ) -> LibMappingInfo {
+        let inlined_frames = InlinedFrames {
+            function_lib: self.lib_handle,
+            function_relative_address: self.relative_address,
+            function_size: (self.end_address - self.start_address) as u32,
+            function_name: self.name_handle,
+            names: inlined_names
+                .map(|name| profile.handle_for_string(name))
+                .collect(),
+        };
+        LibMappingInfo::new_jit_inlined_range(
+            self.lib_handle,
+            self.category,
+            self.js_frame,
+            inlined_frames,
+        )
+    }
+}
 
 fn process_perf_map_line(line: &str) -> Option<(u64, u64, &str)> {
     let mut split = line.splitn(3, ' ');
@@ -26,7 +91,7 @@ pub fn try_load_perf_map(
     pid: u32,
     profile: &mut Profile,
     jit_category_manager: &mut JitCategoryManager,
-    mut recycler: Option<&mut JitFunctionRecycler>,
+    recycler: Option<&mut JitFunctionRecycler>,
 ) -> Option<LibMappings<LibMappingInfo>> {
     let name = format!("perf-{pid}.map");
     let path = format!("/tmp/{name}");
@@ -64,14 +129,53 @@ pub fn try_load_perf_map(
         arch: None,
     });
 
+    let (symbols, mappings) = parse_perf_map(
+        &content,
+        lib_handle,
+        profile,
+        jit_category_manager,
+        recycler,
+    );
+    profile.set_lib_symbol_table(lib_handle, Arc::new(SymbolTable::new(symbols)));
+
+    Some(mappings)
+}
+
+/// Returns the symbols of the JIT functions in the perf map, laid out consecutively
+/// in the fake library `lib_handle`, along with the mappings of their code.
+fn parse_perf_map(
+    content: &str,
+    lib_handle: LibraryHandle,
+    profile: &mut Profile,
+    jit_category_manager: &mut JitCategoryManager,
+    mut recycler: Option<&mut JitFunctionRecycler>,
+) -> (Vec<Symbol>, LibMappings<LibMappingInfo>) {
     let mut symbols = Vec::new();
     let mut mappings = LibMappings::new();
     let mut cumulative_address = 0;
+    let mut current_function: Option<JitFunction> = None;
 
     for (addr, len, symbol_name) in content.lines().filter_map(process_perf_map_line) {
         let start_address = addr;
         let end_address = addr + len;
         let code_size = len as u32;
+
+        if let Some(function) = &current_function {
+            if let Some(inlined_names) =
+                function.inlined_names(start_address, end_address, symbol_name)
+            {
+                // The range overrides a part of the function's mapping, and keeps
+                // pointing into the function's symbol.
+                let offset_in_function = (start_address - function.start_address) as u32;
+                mappings.add_mapping(
+                    start_address,
+                    end_address,
+                    function.relative_address + offset_in_function,
+                    function.inlined_range_info(inlined_names, profile),
+                );
+                continue;
+            }
+        }
 
         // Pretend that all JIT code is laid out consecutively in our fake library.
         // This relative address is used for symbolication whenever we add a frame
@@ -105,9 +209,94 @@ pub fn try_load_perf_map(
             relative_address,
             LibMappingInfo::new_jit_function(lib_handle, category, js_frame),
         );
+
+        current_function = Some(JitFunction {
+            start_address,
+            end_address,
+            name: symbol_name,
+            name_handle: profile.handle_for_string(symbol_name),
+            lib_handle,
+            relative_address,
+            category,
+            js_frame,
+        });
     }
 
-    profile.set_lib_symbol_table(lib_handle, Arc::new(SymbolTable::new(symbols)));
+    (symbols, mappings)
+}
 
-    Some(mappings)
+#[cfg(test)]
+mod tests {
+    use fxprof_processed_profile::{ReferenceTimestamp, SamplingInterval};
+
+    use super::*;
+
+    /// Returns the relative address and the inlined function names for each address.
+    fn resolve(content: &str, addresses: &[u64]) -> Vec<Option<(u32, Vec<String>)>> {
+        let mut profile = Profile::new(
+            "",
+            ReferenceTimestamp::from_millis_since_unix_epoch(0.0),
+            SamplingInterval::from_millis(1),
+        );
+        let lib_handle = profile.add_lib(LibraryInfo {
+            name: "perf.map".to_owned(),
+            debug_name: "perf.map".to_owned(),
+            path: "perf.map".to_owned(),
+            debug_path: "perf.map".to_owned(),
+            debug_id: DebugId::nil(),
+            code_id: None,
+            arch: None,
+        });
+        let (_symbols, mappings) = parse_perf_map(
+            content,
+            lib_handle,
+            &mut profile,
+            &mut JitCategoryManager::new(),
+            None,
+        );
+        addresses
+            .iter()
+            .map(|address| {
+                let (relative_address, info) = mappings.convert_address(*address)?;
+                let inlined_names = info.inlined_frames.iter().flat_map(|f| f.names.iter());
+                let inlined_names = inlined_names.map(|name| profile.get_string(*name).to_owned());
+                Some((relative_address, inlined_names.collect()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn inlined_ranges_refine_the_preceding_function() {
+        let content = "\
+1000 100 first
+2000 100 outer
+2010 10 outer->middle
+2020 10 outer->middle->inner
+3000 100 call<fn() -> u8>
+4000 10 outer->stray
+";
+        let resolved = resolve(
+            content,
+            &[
+                0x1000, 0x2000, 0x2010, 0x2028, 0x2030, 0x3000, 0x4000, 0x5000,
+            ],
+        );
+
+        let names = |names: &[&str]| names.iter().map(|name| name.to_string()).collect();
+        assert_eq!(
+            resolved,
+            [
+                Some((0x0, names(&[]))),
+                // The function `outer` is laid out after `first` in the library.
+                Some((0x100, names(&[]))),
+                Some((0x110, names(&["middle"]))),
+                Some((0x128, names(&["middle", "inner"]))),
+                Some((0x130, names(&[]))),
+                // Not an inline stack: there is no enclosing function of that name.
+                Some((0x200, names(&[]))),
+                Some((0x300, names(&[]))),
+                None,
+            ]
+        );
+    }
 }
