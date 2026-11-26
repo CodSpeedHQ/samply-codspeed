@@ -607,7 +607,8 @@ where
                             continue;
                         }
                         LookupResult::Output(Ok(frame_iter)) => {
-                            convert_frames(frame_iter, &mut string_interner)
+                            let unit = ctx.find_dwarf_and_unit(*svma).skip_all_loads();
+                            convert_frames(frame_iter, unit, &mut string_interner)
                                 .map(FramesLookupResult::Available)
                         }
                         LookupResult::Output(Err(_)) => None,
@@ -696,8 +697,9 @@ where
                         ))
                     }
                     LookupResult::Output(Ok(frame_iter)) => {
+                        let unit = context.find_dwarf_and_unit(svma).skip_all_loads();
                         let mut string_interner = self.string_interner.lock().unwrap();
-                        convert_frames(frame_iter, &mut string_interner)
+                        convert_frames(frame_iter, unit, &mut string_interner)
                             .map(FramesLookupResult::Available)
                     }
                     LookupResult::Output(Err(_)) => {

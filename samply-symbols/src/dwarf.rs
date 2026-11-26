@@ -9,21 +9,32 @@ use object::CompressionFormat;
 
 use crate::{demangle, Error, FrameDebugInfo, SymbolMapStringInterner};
 
+/// rustc gives async fn bodies and async blocks closure symbol names (v0
+/// `{closure#N}`, legacy `{{closure}}`), while their DWARF `DW_AT_name` keeps the
+/// coroutine kind (`{async_fn#N}`, `{async_block#N}`).
+const RUST_CLOSURE_SEGMENT_PREFIXES: [&str; 2] = ["{closure#", "{{closure}}"];
+const RUST_ASYNC_NAME_PREFIX: &str = "{async_";
+/// Bounds the `DW_AT_abstract_origin` / `DW_AT_specification` chain walked to find a name.
+const MAX_DIE_NAME_INDIRECTIONS: usize = 4;
+
 pub fn get_frames<R: Reader>(
     address: u64,
     context: Option<&addr2line::Context<R>>,
     string_interner: &mut SymbolMapStringInterner,
 ) -> Option<Vec<FrameDebugInfo>> {
-    let frame_iter = context?.find_frames(address).skip_all_loads().ok()?;
-    convert_frames(frame_iter, string_interner)
+    let context = context?;
+    let frame_iter = context.find_frames(address).skip_all_loads().ok()?;
+    let unit = context.find_dwarf_and_unit(address).skip_all_loads();
+    convert_frames(frame_iter, unit, string_interner)
 }
 
 pub fn convert_frames<'a, R: gimli::Reader>(
     frame_iter: impl FallibleIterator<Item = addr2line::Frame<'a, R>>,
+    unit: Option<gimli::UnitRef<'_, R>>,
     string_interner: &mut SymbolMapStringInterner,
 ) -> Option<Vec<FrameDebugInfo>> {
     let frames: Vec<_> = frame_iter
-        .map(|f| Ok(convert_stack_frame(f, string_interner)))
+        .map(|f| Ok(convert_stack_frame(f, unit, string_interner)))
         .collect()
         .ok()?;
 
@@ -36,6 +47,7 @@ pub fn convert_frames<'a, R: gimli::Reader>(
 
 pub fn convert_stack_frame<R: gimli::Reader>(
     frame: addr2line::Frame<R>,
+    unit: Option<gimli::UnitRef<'_, R>>,
     string_interner: &mut SymbolMapStringInterner,
 ) -> FrameDebugInfo {
     let location = frame.location;
@@ -43,6 +55,7 @@ pub fn convert_stack_frame<R: gimli::Reader>(
         Some(function_name) => {
             if let Ok(name) = function_name.raw_name() {
                 let name = demangle::demangle_any(&name);
+                let name = rust_async_name(&name, unit, frame.dw_die_offset).unwrap_or(name);
                 Some(string_interner.intern_owned(&name).into())
             } else {
                 None
@@ -67,6 +80,51 @@ pub fn convert_stack_frame<R: gimli::Reader>(
             .and_then(|l| l.column.map(|column| column.max(1))),
         ..Default::default()
     }
+}
+
+/// Replaces the trailing closure segment of a demangled Rust name with the DIE's
+/// `DW_AT_name` when that name marks an async fn or async block, e.g.
+/// `app::work::{closure#0}` -> `app::work::{async_fn#0}`.
+fn rust_async_name<R: gimli::Reader>(
+    demangled_name: &str,
+    unit: Option<gimli::UnitRef<'_, R>>,
+    dw_die_offset: Option<gimli::UnitOffset<R::Offset>>,
+) -> Option<String> {
+    let (parent_path, last_segment) = demangled_name.rsplit_once("::")?;
+    let is_closure_segment = RUST_CLOSURE_SEGMENT_PREFIXES
+        .iter()
+        .any(|prefix| last_segment.starts_with(prefix));
+    if !is_closure_segment {
+        return None;
+    }
+    let die_name = die_name(unit?, dw_die_offset?)?;
+    if !die_name.starts_with(RUST_ASYNC_NAME_PREFIX) {
+        return None;
+    }
+    Some(format!("{parent_path}::{die_name}"))
+}
+
+/// Reads the DIE's `DW_AT_name`, following same-unit abstract origins of inlined
+/// subroutines and declarations of out-of-line definitions.
+fn die_name<R: gimli::Reader>(
+    unit: gimli::UnitRef<'_, R>,
+    mut offset: gimli::UnitOffset<R::Offset>,
+) -> Option<String> {
+    for _ in 0..MAX_DIE_NAME_INDIRECTIONS {
+        let entry = unit.entry(offset).ok()?;
+        if let Some(name) = entry.attr_value(gimli::DW_AT_name) {
+            let name = unit.attr_string(name).ok()?;
+            return Some(name.to_string_lossy().ok()?.into_owned());
+        }
+        let origin = entry
+            .attr_value(gimli::DW_AT_abstract_origin)
+            .or_else(|| entry.attr_value(gimli::DW_AT_specification))?;
+        let gimli::AttributeValue::UnitRef(origin_offset) = origin else {
+            return None;
+        };
+        offset = origin_offset;
+    }
+    None
 }
 
 pub enum SingleSectionData<'data, T: ReadRef<'data>> {
@@ -258,7 +316,7 @@ mod test {
         };
         let mut string_interner = SymbolMapStringInterner::new(SymbolMapGeneration::new());
 
-        let converted = convert_stack_frame(frame, &mut string_interner);
+        let converted = convert_stack_frame(frame, None, &mut string_interner);
 
         assert_eq!(converted.line_number, Some(42));
         assert_eq!(converted.column_number, Some(7));
@@ -284,7 +342,7 @@ mod test {
         };
         let mut string_interner = SymbolMapStringInterner::new(SymbolMapGeneration::new());
 
-        let converted = convert_stack_frame(frame, &mut string_interner);
+        let converted = convert_stack_frame(frame, None, &mut string_interner);
 
         assert_eq!(converted.line_number, Some(42));
         assert_eq!(converted.column_number, Some(1));
