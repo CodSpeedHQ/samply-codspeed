@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use samply_symbols::debugid::DebugId;
 use samply_symbols::{
     self, CandidatePathInfo, CompactSymbolTable, Error, FileAndPathHelper, FileAndPathHelperResult,
-    FileLocation, LibraryInfo, LookupAddress, MultiArchDisambiguator, OptionallySendFuture,
-    SymbolManager, SymbolMap,
+    FileLocation, FramesLookupResult, LibraryInfo, LookupAddress, MultiArchDisambiguator,
+    OptionallySendFuture, SymbolManager, SymbolMap,
 };
 
 async fn get_symbol_map_with_dyld_cache_fallback(
@@ -589,6 +589,59 @@ fn example_linux_fallback() {
     );
     // no _stack_chk_fail@@GLIBC_2.4 please
     assert_eq!(symbol_map.lookup_sync(LookupAddress::Relative(0x6)), None);
+}
+
+/// Function names of the (inline) frames at `relative_address`, innermost first.
+fn frame_function_names(symbol_map: &SymbolMap<Helper>, relative_address: u32) -> Vec<String> {
+    let result = symbol_map
+        .lookup_sync(LookupAddress::Relative(relative_address))
+        .unwrap();
+    let Some(FramesLookupResult::Available(frames)) = result.frames else {
+        panic!("no DWARF frames at {relative_address:#x}");
+    };
+    frames
+        .iter()
+        .map(|frame| {
+            symbol_map
+                .resolve_function_name(frame.function.unwrap())
+                .into_owned()
+        })
+        .collect()
+}
+
+#[test]
+fn rust_async_frames_use_dwarf_async_names() {
+    // Built from fixtures/other/async-rust.rs; every async body is inlined into `main`.
+    let helper = Helper {
+        symbol_directory: fixtures_dir().join("other"),
+    };
+    let symbol_manager = SymbolManager::with_helper(helper);
+    let symbol_map = futures::executor::block_on(symbol_manager.load_symbol_map_from_location(
+        FileLocationType(fixtures_dir().join("other").join("async-rust")),
+        None,
+    ))
+    .unwrap();
+
+    // Inside the async block of `checksum`.
+    assert_eq!(
+        frame_function_names(&symbol_map, 0x1910),
+        [
+            "async_rust::checksum::{closure#0}::{async_block#0}",
+            "async_rust::checksum::{async_fn#0}",
+            "async_rust::block_on::<async_rust::checksum::{closure#0}>",
+            "main",
+        ]
+    );
+    // Inside `parse_records`, awaited by `checksum`.
+    assert_eq!(
+        frame_function_names(&symbol_map, 0x1968),
+        [
+            "async_rust::parse_records::{async_fn#0}",
+            "async_rust::checksum::{async_fn#0}",
+            "async_rust::block_on::<async_rust::checksum::{closure#0}>",
+            "main",
+        ]
+    );
 }
 
 #[test]
